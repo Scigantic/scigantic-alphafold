@@ -157,7 +157,7 @@ def test_info_with_no_published_index_exits_1(afdb: Afdb, capsys: pytest.Capture
     code, stdout, stderr = run(capsys, "info")
     assert code == 1 and stdout == ""
     line = one_line_error(stderr)
-    assert "has not been published yet" in line and "SCIGANTIC_ALPHAFOLD_INDEX" in line
+    assert "may not be published yet or may be mid-update" in line and "SCIGANTIC_ALPHAFOLD_INDEX" in line
 
 
 def test_info_with_an_unknown_schema_exits_1(afdb: Afdb, capsys: pytest.CaptureFixture[str]) -> None:
@@ -201,6 +201,11 @@ def fake_build(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[Any, ..
     def merge_parts(*args: Any, **kwargs: Any) -> Path:
         calls.append(("merge_parts", args, kwargs))
         return Path(args[1])
+
+    def _filtered_metadata(only: list[str]) -> list[dict[str, Any]]:
+        return [{"archive_name": name} for name in only]
+
+    module._filtered_metadata = _filtered_metadata  # type: ignore[attr-defined]
 
     module.build_part = build_part  # type: ignore[attr-defined]
     module.merge_parts = merge_parts  # type: ignore[attr-defined]
@@ -271,3 +276,140 @@ def test_module_entry_point_end_to_end(afdb: Afdb, tmp_path: Path) -> None:
     bad = subprocess.run([*base, "get", "A0A999ZZZ9", "-o", str(tmp_path)], capture_output=True, text=True, env=env)
     assert bad.returncode == 1 and bad.stdout == ""
     assert bad.stderr.startswith("scigantic-alphafold: error: A0A999ZZZ9") and bad.stderr.count("\n") == 1
+
+
+# -- review fixes ----------------------------------------------------------------------------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def test_get_honors_a_file_name_id(afdb: Afdb, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, stdout, _ = run(capsys, "get", "AF-P69905-F1-model_v6.pdb.gz", "-o", str(tmp_path))
+    assert code == 0
+    assert stdout.strip() == str(tmp_path / "AF-P69905-F1-model_v6.pdb")
+    code, stdout, stderr = run(capsys, "get", "AF-P69905-F1-model_v6.pdb.gz", "-f", "cif", "-o", str(tmp_path))
+    assert code == 1 and stdout == ""
+    assert "is a pdb file name but fmt='cif'" in one_line_error(stderr)
+    code, _, stderr = run(capsys, "get", "AF-P69905-F1-model_v4.cif", "--stdout")
+    assert code == 1
+    assert "the index describes v6" in one_line_error(stderr)
+    code, stdout, _ = run(capsys, "locate", "AF-P69905-F1-model_v6.pdb.gz")
+    assert code == 0
+    assert [line.split("\t")[1] for line in stdout.splitlines()[1:]] == ["pdb"]
+
+
+def test_relative_index_path_from_the_shell(afdb: Afdb) -> None:
+    env = {**os.environ, _index.ENV_INDEX: "index-v6.sqlite", _index.ENV_CACHE: os.path.join("rel", "cache")}
+    done = subprocess.run(
+        [sys.executable, "-m", "scigantic_alphafold.cli", "get", "P69905", "--stdout"],
+        capture_output=True, text=True, env=env, cwd=afdb.root,
+    )  # fmt: skip
+    assert (done.returncode, done.stderr) == (0, "")
+    assert done.stdout == afdb.text("AF-P69905-F1")
+
+
+def test_merge_only_delegates_a_filtered_tar_list(fake_build: list[Any], capsys: pytest.CaptureFixture[str]) -> None:
+    code, stdout, stderr = run(capsys, "merge", "parts", "-o", "index-v6.sqlite", "--only", "A_v6.tar", "B_v6.tar")
+    assert (code, stderr) == (0, "")
+    assert stdout.strip() == "index-v6.sqlite"
+    assert fake_build == [
+        ("merge_parts", ("parts", "index-v6.sqlite"), {"metadata": [{"archive_name": "A_v6.tar"}, {"archive_name": "B_v6.tar"}]})
+    ]
+
+
+def test_the_partial_build_advice_works_as_written(afdb: Afdb, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """build-part one tar, merge --only that tar, point the env var at the result (a relative path), fetch."""
+    from conftest import build_tar, structure_text
+    from scigantic_alphafold import _build
+
+    name = "UP000000002_2_MINI_v6.tar"
+    members = [("AF-M00001-F1", "cif"), ("AF-M00001-F1", "pdb"), ("AF-M00002-F1", "cif"), ("AF-M00002-F1", "pdb")]
+    afdb.server.files[f"/v6/{name}"], _ = build_tar(members, name)
+    listing = [
+        {"archive_name": name, "num_predicted_structures": 2, "size_bytes": len(afdb.server.files[f"/v6/{name}"]),
+         "type": "proteome", "species": "Minimus", "common_name": "mini", "reference_proteome": "UP000000002", "label": "mini"},
+        {"archive_name": "UP000000003_3_NEVERBUILT_v6.tar", "num_predicted_structures": 9, "size_bytes": 1,
+         "type": "proteome", "species": "Other", "common_name": "other", "reference_proteome": "UP000000003", "label": "other"},
+    ]  # fmt: skip
+    monkeypatch.setattr(_build, "fetch_download_metadata", lambda **kwargs: listing)
+    monkeypatch.chdir(afdb.root)
+
+    code, _, stderr = run(capsys, "build-part", name, "-o", "parts", "--base-url", f"{afdb.server.base}/v6")
+    assert code == 0, stderr
+    # Without --only, every listed tar needs a part file: this is what the old advice ran into.
+    code, _, stderr = run(capsys, "merge", "parts", "-o", "full.sqlite")
+    assert code == 1 and "scigantic-alphafold: error:" in stderr
+    assert not (afdb.root / "full.sqlite").exists()
+    code, stdout, stderr = run(capsys, "merge", "parts", "-o", "index-v6-mini.sqlite", "--only", name)
+    assert code == 0, stderr
+
+    afdb.use("index-v6-mini.sqlite")
+    assert [t.name for t in af.tars()] == [name]
+    assert af.fetch("M00002", fmt="pdb") == structure_text("AF-M00002-F1", "pdb", name)
+    assert af.fetch("m00001") == structure_text("AF-M00001-F1", "cif", name)
+
+
+def test_version_has_one_source() -> None:
+    from importlib.metadata import version
+
+    assert version("scigantic-alphafold") == af.__version__
+    pyproject = REPO / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("not running from a source tree")
+    text = pyproject.read_text(encoding="utf-8")
+    project = text.split("[project]", 1)[1].split("\n[", 1)[0]
+    assert 'dynamic = ["version"]' in project
+    assert "\nversion =" not in project
+    assert 'version = { attr = "scigantic_alphafold._version.__version__" }' in text
+    assert 'license = "MIT-0"' in project and "License ::" not in text
+
+
+def test_sdist_manifest_ships_the_test_fixtures() -> None:
+    manifest = REPO / "MANIFEST.in"
+    if not (REPO / "pyproject.toml").is_file():
+        pytest.skip("not running from a source tree")
+    lines = manifest.read_text(encoding="utf-8").splitlines()
+    assert "include tests/conftest.py" in lines and "prune build" in lines
+
+
+def publish_workflow() -> str:
+    path = REPO / ".github" / "workflows" / "publish.yml"
+    if not path.is_file():
+        pytest.skip("the workflows are not part of an sdist")
+    return path.read_text(encoding="utf-8")
+
+
+def test_publish_workflow_is_locked_down() -> None:
+    text = publish_workflow()
+    assert "\npermissions:\n  contents: read\n" in text
+    assert "workflow_dispatch" not in text.split("\njobs:", 1)[0].split("\non:", 1)[1]
+    assert "tags: ['v*']" in text
+    # The tag check comes before anything is built or uploaded.
+    assert text.index("The tag must be v<version>") < text.index("python -m build") < text.index("twine upload")
+    assert "needs: [test, typecheck]" in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="runs the workflow's bash step")
+@pytest.mark.parametrize(
+    ("ref_type", "ref_name", "ok"),
+    [("tag", f"v{af.__version__}", True), ("tag", "v999.0.0", False), ("tag", af.__version__, False), ("branch", f"v{af.__version__}", False), ("branch", "main", False)],
+)
+def test_publish_tag_check_step(ref_type: str, ref_name: str, ok: bool) -> None:
+    import textwrap
+
+    text = publish_workflow()
+    step = text.split("- name: The tag must be v<version>", 1)[1].split("run: |\n", 1)[1].split("      - name:", 1)[0]
+    script = textwrap.dedent(step)
+    env = {**os.environ, "GITHUB_REF_TYPE": ref_type, "GITHUB_REF_NAME": ref_name}
+    done = subprocess.run(["bash", "-euo", "pipefail", "-c", script], capture_output=True, text=True, env=env, cwd=REPO)
+    assert (done.returncode == 0) == ok, done.stdout + done.stderr
+    if not ok:
+        assert "nothing was published" in done.stdout
+
+
+def test_ci_has_a_windows_leg() -> None:
+    path = REPO / ".github" / "workflows" / "ci.yml"
+    if not path.is_file():
+        pytest.skip("the workflows are not part of an sdist")
+    text = path.read_text(encoding="utf-8")
+    assert "os: windows-latest" in text and "runs-on: ${{ matrix.os }}" in text

@@ -38,7 +38,7 @@ def _locate(args: argparse.Namespace) -> int:
     members = _index.locate(args.id, args.format)
     if not members:
         # Same wording as a failed fetch.
-        _index.get_index().resolve(args.id, args.format or "cif")
+        _index.get_index().resolve(args.id, args.format)
     print("entry_id\tfmt\ttar\toffset\tlength\turl")
     for m in members:
         print(f"{m.entry_id}\t{m.fmt}\t{m.tar}\t{m.offset}\t{m.length}\t{m.url}")
@@ -72,10 +72,15 @@ def _build_part(args: argparse.Namespace) -> int:
 
 
 def _merge(args: argparse.Namespace) -> int:
-    from ._build import merge_parts
+    from ._build import _filtered_metadata, merge_parts
 
     try:
-        print(merge_parts(args.parts_dir, args.out))
+        if args.only:
+            # Same meaning as `python -m scigantic_alphafold._build merge --only`: an index
+            # of just these tars, instead of requiring a part file for every tar EBI lists.
+            print(merge_parts(args.parts_dir, args.out, metadata=_filtered_metadata(args.only)))
+        else:
+            print(merge_parts(args.parts_dir, args.out))
     except (RuntimeError, ValueError) as exc:
         _fail(str(exc))
         return 1
@@ -93,7 +98,13 @@ def _parser() -> argparse.ArgumentParser:
 
     get = sub.add_parser("get", help="download structures, or print them with --stdout")
     get.add_argument("ids", nargs="+", metavar="id", help="UniProt accession or entry id (P69905, AF-P69905-F1)")
-    get.add_argument("-f", "--format", choices=_index.FORMATS, default="cif", help="file format (default: cif)")
+    get.add_argument(
+        "-f",
+        "--format",
+        choices=_index.FORMATS,
+        default=None,
+        help="file format (default: cif, or the extension when the id is a file name)",
+    )
     get.add_argument("-o", "--out", default=".", metavar="DIR", help="output directory (default: .)")
     get.add_argument("--stdout", action="store_true", help="write the decompressed text to standard output")
     get.set_defaults(run=_get)
@@ -118,6 +129,12 @@ def _parser() -> argparse.ArgumentParser:
     merge = sub.add_parser("merge", help="merge part files into one SQLite index")
     merge.add_argument("parts_dir", metavar="parts-dir", help="directory holding the <tar>.tsv.gz part files")
     merge.add_argument("-o", "--out", required=True, metavar="FILE", help="index to write, for example index-v6.sqlite")
+    merge.add_argument(
+        "--only",
+        nargs="+",
+        metavar="TAR",
+        help="build a partial index of just these tars (without it, every tar EBI lists needs a part file)",
+    )
     merge.set_defaults(run=_merge)
     return parser
 

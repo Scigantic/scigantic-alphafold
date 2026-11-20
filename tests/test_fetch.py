@@ -4,6 +4,7 @@ import gzip
 import io
 import os
 import sqlite3
+import sys
 import tarfile
 import time
 import urllib.request
@@ -256,6 +257,7 @@ def test_a_refused_connection_is_retried_then_reported(afdb: Afdb) -> None:
     afdb.write_index(dead)
     conn = sqlite3.connect(dead)
     conn.execute("UPDATE tars SET url = 'http://127.0.0.1:1/v6/' || name")
+    conn.execute("UPDATE meta SET value = 'http://127.0.0.1:1/v6' WHERE key = 'base_url'")
     conn.commit()
     conn.close()
     afdb.use(dead)
@@ -345,7 +347,8 @@ def test_download_writes_the_decompressed_file(afdb: Afdb, tmp_path: Path) -> No
         "AF-P69905-F1-model_v6.pdb",
         "AF-Q00001-F10-model_v6.cif",
     ]
-    assert oct(path.stat().st_mode & 0o777) == "0o644"
+    if sys.platform != "win32":
+        assert oct(path.stat().st_mode & 0o777) == "0o644"
 
 
 def test_download_compressed(afdb: Afdb, tmp_path: Path) -> None:
@@ -388,10 +391,10 @@ def test_a_failed_download_leaves_the_old_file_and_no_temp(afdb: Afdb, tmp_path:
     def failing_replace(src: str, dst: str) -> None:
         raise OSError("disk went away")
 
-    monkeypatch.setattr(os, "replace", failing_replace)
-    with pytest.raises(OSError, match="disk went away"):
-        af.download("P69905", out)
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError, match="disk went away"):
+            af.download("P69905", out)
     assert [p.name for p in out.iterdir()] == [target.name]
     assert target.read_text() == "the previous complete file"
 
@@ -430,7 +433,10 @@ def test_live_one_range_request_against_ebi(tmp_path: Path, monkeypatch: pytest.
     from conftest import SCHEMA
 
     conn.executescript(SCHEMA)
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '1'), ('afdb_version', '6')")
+    conn.execute(
+        "INSERT INTO meta VALUES ('schema_version', '1'), ('afdb_version', '6'), (?, ?)",
+        ("base_url", url.rsplit("/", 1)[0]),
+    )
     conn.execute(
         "INSERT INTO tars VALUES (1, ?, ?, ?, ?, ?, 'proteome', 'UP000000429', 85962, NULL, NULL, 1)",
         (name, url, total, modified, etag),
@@ -450,3 +456,56 @@ def test_live_one_range_request_against_ebi(tmp_path: Path, monkeypatch: pytest.
     else:
         assert "\nATOM " in text
     assert _fetch.DEFAULT_WORKERS == 4
+
+
+# -- review fixes ----------------------------------------------------------------------------------------------
+
+
+def test_file_name_id_reads_its_own_format(afdb: Afdb, tmp_path: Path) -> None:
+    assert af.fetch("AF-P69905-F1-model_v6.pdb.gz") == afdb.text("AF-P69905-F1", "pdb")
+    assert af.fetch("AF-P69905-F1-model_v6.pdb", fmt="pdb") == afdb.text("AF-P69905-F1", "pdb")
+    assert gzip.decompress(af.fetch_bytes("af-p69905-f1-model_v6.pdb.gz")).decode() == afdb.text("AF-P69905-F1", "pdb")
+    assert af.download("AF-P69905-F1-model_v6.pdb.gz", tmp_path).name == "AF-P69905-F1-model_v6.pdb"
+    assert af.fetch_many(["AF-P69905-F1-model_v6.pdb.gz", "P12345"]) == {
+        "AF-P69905-F1-model_v6.pdb.gz": afdb.text("AF-P69905-F1", "pdb"),
+        "P12345": afdb.text("AF-P12345-F1"),
+    }
+
+
+def test_file_name_id_conflicts_make_no_request(afdb: Afdb) -> None:
+    with pytest.raises(af.InvalidIdError, match="is a pdb file name but fmt='cif'"):
+        af.fetch("AF-P69905-F1-model_v6.pdb.gz", fmt="cif")
+    with pytest.raises(af.InvalidIdError, match="names AlphaFold DB v4, but the index describes v6"):
+        af.fetch("AF-P69905-F1-model_v4.cif")
+    with pytest.raises(af.FetchManyError) as caught:
+        af.fetch_many(["AF-P69905-F1-model_v6.pdb.gz", "P12345"], fmt="cif")
+    assert isinstance(caught.value.errors["AF-P69905-F1-model_v6.pdb.gz"], af.InvalidIdError)
+    assert list(caught.value.results) == ["P12345"]
+    assert len(afdb.server.requests) == 1
+
+
+def test_download_name_cannot_be_steered_by_the_index(afdb: Afdb, tmp_path: Path) -> None:
+    out = tmp_path / "a" / "b" / "c" / "out"
+    afdb.use(afdb.edit_index("traversal.sqlite", "UPDATE meta SET value = '6/../../../escaped' WHERE key = 'afdb_version'"))
+    with pytest.raises(af.IndexSchemaError, match="afdb_version"):
+        af.download("P69905", out)
+    assert not out.exists()
+    assert [p for p in tmp_path.rglob("*escaped*")] == []
+    assert afdb.server.requests == []
+
+
+def test_hostile_tar_url_is_refused_for_every_reader(afdb: Afdb, tmp_path: Path) -> None:
+    afdb.server.files["/internal/admin"] = afdb.tars[PROTEOME_TAR]
+    afdb.use(afdb.edit_index("hostile.sqlite", f"UPDATE tars SET url = '{afdb.server.base}/internal/admin'"))
+    for call in (
+        lambda: af.fetch("P69905"),
+        lambda: af.fetch_bytes("P69905"),
+        lambda: af.download("P69905", tmp_path / "out"),
+    ):
+        with pytest.raises(af.IndexSchemaError, match="outside its own base_url"):
+            call()
+    with pytest.raises(af.FetchManyError) as caught:
+        af.fetch_many(["P69905"])
+    assert isinstance(caught.value.errors["P69905"], af.IndexSchemaError)
+    assert afdb.server.requests == []
+    assert not (tmp_path / "out").exists()

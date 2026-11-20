@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import dataclasses
 import gzip
+import hashlib
+import http.client
+import json
+import os
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -28,7 +34,8 @@ def test_import_touches_neither_network_nor_cache(tmp_path: Path) -> None:
         "import scigantic_alphafold as af\n"
         "print(af.__version__)\n"
     )
-    env = {"PATH": "/usr/bin:/bin", "SCIGANTIC_ALPHAFOLD_CACHE": str(cache), "HOME": str(tmp_path)}
+    env = {**os.environ, "SCIGANTIC_ALPHAFOLD_CACHE": str(cache), "HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+    env.pop("SCIGANTIC_ALPHAFOLD_INDEX", None)
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == af.__version__
@@ -324,9 +331,14 @@ def test_default_index_404_says_not_published(afdb: Afdb, monkeypatch: pytest.Mo
     with pytest.raises(af.IndexUnavailableError) as caught:
         af.has("P69905")
     message = str(caught.value)
-    assert "has not been published yet" in message
-    assert "SCIGANTIC_ALPHAFOLD_INDEX=/path/to/index-v6.sqlite" in message
-    assert "build-part" in message and "merge" in message
+    assert "could not be downloaded" in message and "returned 404" in message
+    assert "may not be published yet or may be mid-update" in message
+    assert "has not been published yet" not in message  # a 404 does not prove that
+    # The advice is a partial build that works with one tar: merge needs --only for that.
+    tar = "UP000000429_85962_HELPY_v6.tar"
+    assert f"scigantic-alphafold build-part {tar} -o parts" in message
+    assert f"scigantic-alphafold merge parts -o index-v6.sqlite --only {tar}" in message
+    assert "SCIGANTIC_ALPHAFOLD_INDEX=index-v6.sqlite" in message
     assert not any(afdb.cache_dir.iterdir())  # nothing half-written is left behind
 
 
@@ -412,7 +424,7 @@ def test_racing_processes_leave_one_good_cache_file(afdb: Afdb) -> None:
     source = f"{afdb.server.base}/index/index-v6.sqlite.gz"
     afdb.server.delay = 0.05
     code = "import scigantic_alphafold as af; print(af.locate('P69905', fmt='pdb')[0].entry_id)"
-    env = {"PATH": "/usr/bin:/bin", _index.ENV_INDEX: source, _index.ENV_CACHE: str(afdb.cache_dir)}
+    env = {**os.environ, _index.ENV_INDEX: source, _index.ENV_CACHE: str(afdb.cache_dir)}
     running = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env) for _ in range(4)]
     for process in running:
         out, err = process.communicate(timeout=60)
@@ -423,6 +435,7 @@ def test_racing_processes_leave_one_good_cache_file(afdb: Afdb) -> None:
     assert files[0].read_bytes() == afdb.index_path.read_bytes()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot replace a file another connection has open")
 def test_a_reader_survives_a_refresh_by_someone_else(afdb: Afdb) -> None:
     source = f"{afdb.server.base}/index/index-v6.sqlite.gz"
     reader = _index.Index(source, afdb.cache_dir)
@@ -456,3 +469,384 @@ def test_one_index_shared_by_many_threads(afdb: Afdb) -> None:
         thread.join(timeout=30)
     assert not failures
     assert [got[i] for i in range(len(ids))] == expect
+
+
+# -- review fixes: paths ----------------------------------------------------------------------------------
+
+
+def test_relative_index_path(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(afdb.root)
+    afdb.use("index-v6.sqlite")
+    assert af.has("P69905")
+    assert af.index_info()["path"] == str(afdb.index_path)
+    assert af.fetch("P69905") == afdb.text("AF-P69905-F1")
+    afdb.use(os.path.join(".", "index-v6.sqlite.gz"))
+    assert af.has("P69905")
+
+
+def test_relative_cache_dir(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(afdb.root)
+    monkeypatch.setenv(_index.ENV_CACHE, os.path.join("rel", "cache"))
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    assert af.has("P69905")
+    path = Path(af.index_info()["path"])
+    assert path.is_absolute() and path.parent == afdb.root / "rel" / "cache"
+    assert af.refresh_index() == path
+
+
+def test_tilde_is_expanded_in_both_paths(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = afdb.root / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(afdb.root)
+    (home / "idx.sqlite.gz").write_bytes((afdb.root / "index-v6.sqlite.gz").read_bytes())
+    monkeypatch.setenv(_index.ENV_CACHE, os.path.join("~", "af-cache"))
+    afdb.use(os.path.join("~", "idx.sqlite.gz"))
+    assert af.has("P69905")
+    assert Path(af.index_info()["path"]).parent == home / "af-cache"
+    assert not (afdb.root / "~").exists()  # no directory literally named "~"
+
+
+@pytest.mark.parametrize("source", ["url", "gz"])
+def test_unusable_cache_dir_is_a_library_error(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    blocker = afdb.root / "a-file"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv(_index.ENV_CACHE, str(blocker / "cache"))
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz" if source == "url" else afdb.root / "index-v6.sqlite.gz")
+    with pytest.raises(af.IndexUnavailableError, match="Cannot open the index"):
+        af.has("P69905")
+    with pytest.raises(af.AlphaFoldError):
+        af.fetch("P69905")
+
+
+@pytest.mark.parametrize("bad", ["bad\0path.sqlite", "", "   ", "."])
+def test_odd_index_paths_never_escape_as_other_errors(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    index = _index.Index(bad or None, afdb.cache_dir)
+    if not bad.strip():
+        monkeypatch.setattr(_index, "DEFAULT_INDEX_URL", f"{afdb.server.base}/releases/index-v6.sqlite.gz")
+        index = _index.Index(None, afdb.cache_dir)
+    try:
+        with pytest.raises(af.AlphaFoldError):
+            index.has("P69905")
+    finally:
+        index.close()
+
+
+# -- review fixes: refresh on a platform that cannot replace an open file ------------------------------------
+
+
+def test_refresh_closes_its_own_connection_before_replacing(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulated Windows: os.replace fails while this process has the cached index open."""
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    assert af.has("P69905")
+    index = _index.get_index()
+    assert index._conn is not None
+    real_replace = os.replace
+    held_open: list[bool] = []
+
+    def windows_replace(src: str, dst: str) -> None:
+        held_open.append(index._conn is not None)
+        if index._conn is not None:
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", windows_replace)
+    path = af.refresh_index()
+    assert held_open == [False]
+    assert af.has("P69905") and Path(af.index_info()["path"]) == path
+
+
+def test_refresh_blocked_by_another_process_keeps_the_old_index(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    assert af.has("P69905")
+    attempts: list[str] = []
+
+    def always_locked(src: str, dst: str) -> None:
+        attempts.append(dst)
+        raise PermissionError(13, "being used by another process")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", always_locked)
+        with pytest.raises(af.IndexUnavailableError, match="Another process probably has it open"):
+            af.refresh_index()
+    assert len(attempts) == _index._REPLACE_ATTEMPTS
+    assert af.has("P69905")  # the old file is opened again
+    assert [p.name for p in afdb.cache_dir.iterdir()] == ["index-" + hashlib.sha256(f"{afdb.server.base}/index/index-v6.sqlite.gz".encode()).hexdigest()[:16] + ".sqlite"]
+
+
+def test_first_open_uses_the_copy_another_process_holds(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two cold starts race on Windows: the loser cannot replace the winner's open file, and need not."""
+    source = f"{afdb.server.base}/index/index-v6.sqlite.gz"
+    winner = _index.Index(source, afdb.cache_dir)
+    loser = _index.Index(source, afdb.cache_dir)
+    try:
+        assert winner.has("P69905")  # the winner finished and holds the file open
+        real_is_file = Path.is_file
+        looked: list[Path] = []
+
+        def cold(self: Path) -> bool:
+            # The loser looked before the winner had finished, so it downloads too.
+            if self.parent == afdb.cache_dir and self.suffix == ".sqlite" and not looked:
+                looked.append(self)
+                return False
+            return real_is_file(self)
+
+        replaces: list[str] = []
+
+        def locked(src: str, dst: str) -> None:
+            replaces.append(dst)
+            raise PermissionError(13, "being used by another process")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "is_file", cold)
+            patched.setattr(os, "replace", locked)
+            assert loser.resolve("P69905", "cif").entry_id == "AF-P69905-F1"
+        assert len(looked) == 1 and len(replaces) == 1
+        assert len(list(afdb.cache_dir.iterdir())) == 1  # the loser's temp files are gone
+    finally:
+        winner.close()
+        loser.close()
+
+
+# -- review fixes: file-name ids -----------------------------------------------------------------------------
+
+
+def test_file_name_id_decides_the_format_when_fmt_is_left_out(afdb: Afdb) -> None:
+    index = _index.get_index()
+    assert index.resolve("AF-P69905-F1-model_v6.pdb.gz").fmt == "pdb"
+    assert index.resolve("af-p69905-f1-model_v6.pdb").fmt == "pdb"
+    assert index.resolve("AF-P69905-F1-model_v6.cif.gz").fmt == "cif"
+    assert index.resolve("AF-P69905-F1-model_v6").fmt == "cif"
+    assert index.resolve("P69905").fmt == "cif"
+    assert index.resolve("AF-P69905-F1-model_v6.pdb.gz", "pdb").fmt == "pdb"
+    assert [m.fmt for m in af.locate("AF-P69905-F1-model_v6.pdb.gz")] == ["pdb"]
+    assert af.has("AF-P69905-F1-model_v6.pdb.gz")
+    assert not af.has("AF-P11111-F1-model_v6.pdb.gz")  # stored as cif only
+
+
+def test_file_name_id_conflicting_with_fmt_is_rejected(afdb: Afdb) -> None:
+    index = _index.get_index()
+    with pytest.raises(af.InvalidIdError, match="is a pdb file name but fmt='cif'"):
+        index.resolve("AF-P69905-F1-model_v6.pdb.gz", "cif")
+    with pytest.raises(af.InvalidIdError, match="is a cif file name but fmt='pdb'"):
+        af.locate("AF-P69905-F1-model_v6.cif", fmt="pdb")
+
+
+@pytest.mark.parametrize("text", ["AF-P69905-F1-model_v4.cif", "AF-P69905-F1-model_v4", "P69905-F1-model_v7.pdb.gz"])
+def test_file_name_id_of_another_version_is_rejected(afdb: Afdb, text: str) -> None:
+    with pytest.raises(af.InvalidIdError, match="the index describes v6"):
+        _index.get_index().resolve(text)
+    with pytest.raises(af.InvalidIdError):
+        af.locate(text)
+
+
+def test_gz_without_a_format_is_not_an_id(afdb: Afdb) -> None:
+    with pytest.raises(af.InvalidIdError):
+        af.locate("AF-P69905-F1-model_v6.gz")
+
+
+# -- review fixes: the index is checked, not trusted ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["6/../../../escaped", "v6", "", "6 "])
+def test_afdb_version_must_be_digits(afdb: Afdb, value: str) -> None:
+    afdb.use(afdb.edit_index("badversion.sqlite", f"UPDATE meta SET value = '{value}' WHERE key = 'afdb_version'"))
+    with pytest.raises(af.IndexSchemaError) as caught:
+        af.has("P69905")
+    assert repr(value) in str(caught.value) and "afdb_version" in str(caught.value)
+
+
+def test_missing_afdb_version(afdb: Afdb) -> None:
+    afdb.use(afdb.edit_index("noversion.sqlite", "DELETE FROM meta WHERE key = 'afdb_version'"))
+    with pytest.raises(af.IndexSchemaError, match="afdb_version None"):
+        af.has("P69905")
+
+
+def test_tar_url_outside_base_url_is_never_requested(afdb: Afdb) -> None:
+    hostile = f"{afdb.server.base}/internal/admin"
+    afdb.server.files["/internal/admin"] = afdb.tars[PROTEOME_TAR]
+    afdb.use(afdb.edit_index("hostile.sqlite", f"UPDATE tars SET url = '{hostile}'"))
+    with pytest.raises(af.IndexSchemaError) as caught:
+        af.fetch("P69905")
+    assert hostile in str(caught.value) and "outside its own base_url" in str(caught.value)
+    assert afdb.server.requests == []
+
+
+def test_local_server_is_refused_without_the_opt_out(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_index.ENV_ALLOW_ANY_HOST)
+    with pytest.raises(af.IndexSchemaError) as caught:
+        af.fetch("P69905")
+    message = str(caught.value)
+    assert afdb.server.base in message and "ftp.ebi.ac.uk" in message
+    assert "SCIGANTIC_ALPHAFOLD_ALLOW_ANY_HOST=1" in message
+    assert afdb.server.requests == []
+    # Looking things up needs no host at all.
+    assert af.has("P69905") and af.locate("P69905")
+    monkeypatch.setenv(_index.ENV_ALLOW_ANY_HOST, "0")
+    with pytest.raises(af.IndexSchemaError):
+        af.fetch("P69905")
+
+
+@pytest.mark.parametrize(
+    ("base", "url", "expect"),
+    [
+        ("https://ftp.ebi.ac.uk/pub/databases/alphafold/v6", "https://ftp.ebi.ac.uk/pub/databases/alphafold/v6/x.tar", None),
+        ("https://ftp.ebi.ac.uk/pub/databases/alphafold/v6/", "https://ftp.ebi.ac.uk/pub/databases/alphafold/v6/x.tar", None),
+        ("http://ftp.ebi.ac.uk/pub/v6", "http://ftp.ebi.ac.uk/pub/v6/x.tar", "not an https URL"),
+        ("https://ftp.ebi.ac.uk.evil.example/v6", "https://ftp.ebi.ac.uk.evil.example/v6/x.tar", "not an https URL on ftp.ebi.ac.uk"),
+        ("https://ftp.ebi.ac.uk@evil.example/v6", "https://ftp.ebi.ac.uk@evil.example/v6/x.tar", "not an https URL on ftp.ebi.ac.uk"),
+        ("https://ftp.ebi.ac.uk/pub/v6", "https://ftp.ebi.ac.uk/pub/v6-other/x.tar", "outside its own base_url"),
+        ("https://ftp.ebi.ac.uk/pub/v6", "https://evil.example/x.tar", "outside its own base_url"),
+        ("", "https://ftp.ebi.ac.uk/pub/v6/x.tar", "not an https URL"),
+    ],
+)
+def test_tar_url_policy_without_the_opt_out(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, base: str, url: str, expect: str | None) -> None:
+    monkeypatch.delenv(_index.ENV_ALLOW_ANY_HOST)
+    afdb.use(afdb.edit_index("policy.sqlite", f"UPDATE meta SET value = '{base}' WHERE key = 'base_url'"))
+    index = _index.get_index()
+    if expect is None:
+        index.check_tar_url(url)
+    else:
+        with pytest.raises(af.IndexSchemaError, match=expect):
+            index.check_tar_url(url)
+
+
+def test_opt_out_never_allows_other_schemes(afdb: Afdb) -> None:
+    afdb.use(afdb.edit_index("file.sqlite", "UPDATE tars SET url = 'file:///etc/passwd'", "UPDATE meta SET value = 'file:///etc' WHERE key = 'base_url'"))
+    with pytest.raises(af.IndexSchemaError, match="not http"):
+        af.fetch("P69905")
+
+
+def test_malformed_rows_are_refused(afdb: Afdb, tmp_path: Path) -> None:
+    offset, length = afdb.where[PROTEOME_TAR][("AF-P69905-F1", "cif")]
+    afdb.use(afdb.edit_index("rows.sqlite", f"INSERT INTO members VALUES ('AF-Z00001-../../../escaped', 'cif', 2, {offset}, {length})"))
+    with pytest.raises(af.IndexSchemaError, match="malformed entry id"):
+        af.download("Z00001", tmp_path / "out")
+    assert not (tmp_path / "escaped").exists() and afdb.server.requests == []
+    size = len(afdb.tars[PROTEOME_TAR])
+    for name, statement in (
+        ("past.sqlite", f"UPDATE members SET length = {size} WHERE entry_id = 'AF-P69905-F1'"),
+        ("negative.sqlite", "UPDATE members SET offset = -5 WHERE entry_id = 'AF-P69905-F1'"),
+        ("empty.sqlite", "UPDATE members SET length = 0 WHERE entry_id = 'AF-P69905-F1'"),
+    ):
+        afdb.use(afdb.edit_index(name, statement))
+        with pytest.raises(af.IndexSchemaError, match="not inside the tar"):
+            af.fetch("P69905")
+    assert afdb.server.requests == []
+
+
+# -- review fixes: the published checksum ------------------------------------------------------------------------
+
+
+def use_default_url(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, summary: object = None) -> str:
+    monkeypatch.setattr(_index, "DEFAULT_INDEX_URL", f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    if summary is not None:
+        body = summary if isinstance(summary, bytes) else json.dumps(summary).encode()
+        afdb.server.files["/index/index-v6.json"] = body
+    afdb.use(None)
+    return hashlib.sha256(afdb.server.files["/index/index-v6.sqlite.gz"]).hexdigest()
+
+
+def test_checksum_match(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    digest = hashlib.sha256(afdb.server.files["/index/index-v6.sqlite.gz"]).hexdigest()
+    use_default_url(afdb, monkeypatch, {"index_gz_sha256": digest.upper(), "schema_version": "1"})
+    assert af.has("P69905")
+    assert [r["path"] for r in afdb.server.requests] == ["/index/index-v6.sqlite.gz", "/index/index-v6.json"]
+    assert afdb.server.requests[1]["user_agent"].startswith("scigantic-alphafold/")
+
+
+def test_checksum_mismatch_fails_closed(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    actual = use_default_url(afdb, monkeypatch, {"index_gz_sha256": "0" * 64})
+    with pytest.raises(af.IndexUnavailableError) as caught:
+        af.has("P69905")
+    message = str(caught.value)
+    assert "does not match the checksum" in message and "0" * 64 in message and actual in message
+    assert "mid-update" in message
+    assert not any(afdb.cache_dir.iterdir())  # nothing was installed
+
+
+def test_checksum_mismatch_on_refresh_keeps_the_working_index(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    use_default_url(afdb, monkeypatch)
+    assert af.has("P69905")
+    afdb.server.files["/index/index-v6.json"] = json.dumps({"index_gz_sha256": "f" * 64}).encode()
+    with pytest.raises(af.IndexUnavailableError, match="does not match the checksum"):
+        af.refresh_index()
+    assert af.has("P69905")
+    assert [p.name for p in afdb.cache_dir.iterdir()] == ["index-v6.sqlite"]
+
+
+@pytest.mark.parametrize("summary", [None, {"schema_version": "1"}, {"index_gz_sha256": None}])
+def test_no_published_checksum_proceeds(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, summary: object) -> None:
+    use_default_url(afdb, monkeypatch, summary)
+    assert af.has("P69905")
+    assert afdb.server.count("/index/index-v6.json") == 1
+
+
+@pytest.mark.parametrize("summary", [b"<html>oops</html>", {"index_gz_sha256": "abc"}, {"index_gz_sha256": 5}])
+def test_unusable_summary_fails_closed(afdb: Afdb, monkeypatch: pytest.MonkeyPatch, summary: object) -> None:
+    use_default_url(afdb, monkeypatch, summary)
+    with pytest.raises(af.IndexUnavailableError, match="cannot be verified"):
+        af.has("P69905")
+    assert not any(afdb.cache_dir.iterdir())
+
+
+def test_summary_server_error_fails_closed(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    use_default_url(afdb, monkeypatch, {"index_gz_sha256": "0" * 64})
+    afdb.server.fail_first["/index/index-v6.json"] = [503]
+    with pytest.raises(af.IndexUnavailableError, match="HTTP 503"):
+        af.has("P69905")
+
+
+def test_other_sources_are_not_checked_against_the_summary(afdb: Afdb) -> None:
+    afdb.server.files["/index/index-v6.json"] = json.dumps({"index_gz_sha256": "0" * 64}).encode()
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    assert af.has("P69905")
+    assert afdb.server.count("/index/index-v6.json") == 0
+
+
+def test_real_summary_key_matches_the_builder() -> None:
+    """The key this reader looks for is the one the builder writes."""
+    import inspect
+
+    from scigantic_alphafold import _build
+
+    assert f'"{_index.SUMMARY_SHA256_KEY}"' in inspect.getsource(_build.write_summary)
+
+
+# -- review fixes: smaller items ---------------------------------------------------------------------------------
+
+
+def test_a_broken_chunked_download_is_a_library_error(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+
+    def broken(request: urllib.request.Request, timeout: float = 0.0) -> object:
+        raise http.client.IncompleteRead(b"partial", 100)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(urllib.request, "urlopen", broken)
+        with pytest.raises(af.IndexUnavailableError, match="IncompleteRead"):
+            af.has("P69905")
+    assert not any(afdb.cache_dir.iterdir())
+
+
+def test_stale_part_files_are_swept_after_a_day(afdb: Afdb) -> None:
+    afdb.cache_dir.mkdir()
+    old = afdb.cache_dir / ".index-killed.part"
+    fresh = afdb.cache_dir / ".index-inflight.part"
+    unrelated = afdb.cache_dir / "notes.part"
+    for path in (old, fresh, unrelated):
+        path.write_bytes(b"x")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(old, (two_days_ago, two_days_ago))
+    os.utime(unrelated, (two_days_ago, two_days_ago))
+    afdb.use(f"{afdb.server.base}/index/index-v6.sqlite.gz")
+    assert af.has("P69905")
+    names = {p.name for p in afdb.cache_dir.iterdir()}
+    assert ".index-killed.part" not in names
+    assert {".index-inflight.part", "notes.part"} <= names
+
+
+def test_not_in_bulk_set_suggests_a_refresh(afdb: Afdb) -> None:
+    with pytest.raises(af.NotInBulkSetError, match=r"refresh_index\(\)"):
+        _index.get_index().resolve("A0A999ZZZ9", "cif")

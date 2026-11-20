@@ -49,10 +49,10 @@ def _filler(rng: random.Random, n: int) -> str:
     return base64.b64encode(rng.randbytes(n)).decode()
 
 
-def cif_text(entry_id: str, rng: random.Random) -> str:
+def cif_text(entry_id: str, rng: random.Random, filler: int = 0) -> str:
     return (
         f"data_{entry_id}\n#\n_entry.id {entry_id}\n#\nloop_\n_atom_site.group_PDB\n"
-        f"_atom_site.id\nATOM 1\n# {_filler(rng, rng.randrange(4000, 30000))}\n"
+        f"_atom_site.id\nATOM 1\n# {_filler(rng, filler or rng.randrange(4000, 30000))}\n"
     )
 
 
@@ -82,6 +82,8 @@ def make_tar(
     extras: bool = True,
     seed: int = 0,
     tar_format: int = tarfile.GNU_FORMAT,
+    big: tuple[str, ...] = (),
+    raw: dict[tuple[str, str], bytes] | None = None,
 ) -> Tar:
     rng = random.Random(seed)
     originals: dict[tuple[str, str], bytes] = {}
@@ -97,8 +99,11 @@ def make_tar(
     with tarfile.open(fileobj=buffer, mode="w", format=tar_format) as archive:
         for position, entry_id in enumerate(entry_ids):
             for fmt in formats:
-                text = cif_text(entry_id, rng) if fmt == "cif" else pdb_text(entry_id, rng)
+                filler = 250_000 if entry_id in big else 0
+                text = cif_text(entry_id, rng, filler) if fmt == "cif" else pdb_text(entry_id, rng)
                 blob = gzip.compress(text.encode(), mtime=0)
+                if raw and (entry_id, fmt) in raw:
+                    blob = raw[(entry_id, fmt)]  # arbitrary bytes instead of a model
                 originals[(entry_id, fmt)] = blob
                 add(archive, f"{entry_id}-model_v6.{fmt}.gz", blob)
             if extras and position == 1:
@@ -832,7 +837,13 @@ def test_command_line(
         return result
 
     assert _build.main(["plan", "--base-url", site.base_url]) == 0
-    assert outputs() == {"rebuild": "true", "tars": json.dumps([A], separators=(",", ":"))}
+    assert outputs() == {
+        "rebuild": "true",
+        "jobs": json.dumps([{"tar": A, "segment": "", "part": A}], separators=(",", ":")),
+        "n_jobs": "1",
+    }
+    assert _build.main(["plan", "--base-url", site.base_url, "--scheduled"]) == 0
+    assert outputs() == {"rebuild": "false", "jobs": "[]", "n_jobs": "0"}
     assert _build.main(["build-part", A, "-o", str(parts), "--base-url", site.base_url]) == 0
     assert _build.main(["merge", str(parts), "-o", str(index), "--only", A]) == 0
     assert _build.main(["verify", str(index), "-n", "3", "--per-tar", "1"]) == 0
@@ -847,6 +858,510 @@ def test_command_line(
     site.etags[A] = '"new"'
     assert _build.main(args) == 0
     assert outputs()["rebuild"] == "true"
+
+
+# --------------------------------------------------------------------------
+# Segmented builds: a tar indexed as several byte ranges
+
+
+SEG = "UP000000009_999_SEGMT_v6.tar"
+BIG = "AF-G0013-F1"
+
+
+class Segmented:
+    """A synthetic tar on the server, its whole-tar part and merged rows."""
+
+    def __init__(self, site: Site, tmp_path: Path, tar: Tar, n: int) -> None:
+        self.site = site
+        self.tmp = tmp_path
+        self.tar = tar
+        self.size = len(tar.data)
+        site.add(SEG, tar.data)
+        self.metadata = [{"archive_name": SEG, "num_predicted_structures": n,
+                          "size_bytes": self.size, "type": "proteome"}]
+        whole = _build.build_part(SEG, tmp_path / "whole", base_url=site.base_url)
+        _, self.rows, self.skipped, trailer = read_part(whole)
+        self.end_of_members = trailer["end_of_members"]
+        self.expected = self.merged(tmp_path / "whole")
+        self.count = 0
+
+    def header(self, row: int) -> int:
+        return self.rows[row][2] - 512
+
+    def merged(self, parts: Path) -> tuple[list[Any], list[Any]]:
+        out = parts.parent / (parts.name + "-index") / "index-v6.sqlite"
+        _build.merge_parts(parts, out, metadata=self.metadata)
+        conn = sqlite3.connect(out)
+        result = (
+            conn.execute("SELECT * FROM tars").fetchall(),
+            conn.execute(
+                "SELECT entry_id, fmt, tar_id, offset, length FROM members ORDER BY offset"
+            ).fetchall(),
+        )
+        conn.close()
+        return result
+
+    def build(self, edges: list[int], **kwargs: Any) -> tuple[Path, list[dict[str, Any]]]:
+        """Build one segment per consecutive pair of ``edges``."""
+        self.count += 1
+        parts = self.tmp / f"layout{self.count}"
+        trailers = []
+        n = len(edges) - 1
+        for k in range(1, n + 1):
+            part = _build.build_part(
+                SEG, parts, base_url=self.site.base_url, segment=(k, n),
+                bounds=(edges[k - 1], edges[k]), **kwargs,
+            )
+            assert part.name == f"{SEG}.seg{k:02d}of{n:02d}.tsv.gz"
+            header, _, _, trailer = read_part(part)
+            assert header["segment"]["index"] == k and header["segment"]["count"] == n
+            trailers.append({**trailer, **header["segment"]})
+        return parts, trailers
+
+
+@pytest.fixture()
+def seg(site: Site, tmp_path: Path) -> Segmented:
+    tar = make_tar(entry_ids("G", 24), extras=False, seed=11, big=(BIG,))
+    return Segmented(site, tmp_path, tar, 24)
+
+
+LAYOUTS = [
+    "inside_member_data",
+    "exactly_on_headers",
+    "inside_header_blocks",
+    "one_byte_past_a_header",
+    "in_the_end_padding",
+    "at_the_end_of_archive_marker",
+    "inside_the_last_member",
+    "segments_without_any_header",
+    "every_20_kb",
+    "every_512_bytes_around_a_member",
+]
+
+
+def layout_cuts(seg: Segmented, layout: str) -> list[int]:
+    rows, h = seg.rows, seg.header
+    big_data = next(r[2] for r in rows if r[0] == BIG and r[1] == "cif")
+    if layout == "inside_member_data":
+        return [rows[5][2] + 1024, rows[20][2] + 512 * 3]
+    if layout == "exactly_on_headers":
+        return [h(7), h(19), h(20)]
+    if layout == "inside_header_blocks":
+        return [h(7) + 100, h(19) + 511]
+    if layout == "one_byte_past_a_header":
+        return [h(7) + 1]
+    if layout == "in_the_end_padding":
+        assert seg.end_of_members + 1024 < seg.size
+        return [h(10), seg.end_of_members + 512]
+    if layout == "at_the_end_of_archive_marker":
+        return [seg.end_of_members]
+    if layout == "inside_the_last_member":
+        return [h(3), rows[-1][2] + 512]
+    if layout == "segments_without_any_header":
+        return [big_data + 1024, big_data + 4096, big_data + 8192, big_data + 150_000]
+    if layout == "every_20_kb":
+        return list(range(20_000, seg.size, 20_000))
+    if layout == "every_512_bytes_around_a_member":
+        return list(range(h(9) - 1024, h(10) + 2048, 512))
+    raise AssertionError(layout)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_segments_merge_to_exactly_the_whole_tar_result(seg: Segmented, layout: str) -> None:
+    edges = [0] + layout_cuts(seg, layout) + [seg.size]
+    parts, trailers = seg.build(edges)
+
+    assert seg.merged(parts) == seg.expected
+    assert len(seg.expected[1]) == 48
+
+    biggest = max(r[3] for r in seg.rows)
+    for trailer in trailers:
+        # A segment reads its own range plus at most the member that
+        # straddles its end and one read buffer.
+        span = trailer["end"] - trailer["start"]
+        assert trailer["bytes_read"] <= span + biggest + 2 * 512 + 2 * _build._BUFSIZE
+    # The chain the merge checks: 0, then stop == next first header.
+    assert trailers[0]["first_header"] == 0
+    headers = {r[2] - 512 for r in seg.rows}
+    for before, after in zip(trailers, trailers[1:]):
+        if before["reached_end"] or before["first_header"] is None:
+            assert after["first_header"] is None
+        else:
+            assert before["stop"] == after["first_header"]
+            assert before["stop"] in headers
+    assert any(t["reached_end"] and t["stop"] == seg.end_of_members for t in trailers)
+    if layout == "segments_without_any_header":
+        empty = [t for t in trailers if t["n_cif"] + t["n_pdb"] == 0]
+        assert len(empty) >= 2 and all(t["first_header"] >= t["end"] for t in empty)
+    if layout in ("in_the_end_padding", "at_the_end_of_archive_marker", "inside_the_last_member"):
+        assert trailers[-1]["first_header"] is None and trailers[-1]["stop"] is None
+
+
+@pytest.mark.parametrize("count", [1, 2, 5, 9])
+def test_evenly_sized_segments(seg: Segmented, count: int) -> None:
+    parts = seg.tmp / f"even{count}"
+    for k in range(1, count + 1):
+        _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(k, count))
+    assert seg.merged(parts) == seg.expected
+    assert len(list(parts.iterdir())) == count
+
+
+def test_segments_with_members_that_are_not_models(site: Site, tmp_path: Path) -> None:
+    tar = make_tar(entry_ids("H", 20), extras=True, seed=5)
+    s = Segmented(site, tmp_path, tar, 20)
+    assert s.skipped == tar.skipped
+    for cuts in (list(range(10_000, s.size, 10_000)), [s.header(4), s.header(5)]):
+        parts, _ = s.build([0] + cuts + [s.size])
+        assert s.merged(parts) == s.expected
+        skipped = [name for p in sorted(parts.iterdir()) for name in read_part(p)[2]]
+        assert skipped == tar.skipped
+
+
+def test_segment_resumes_after_dropped_connections(seg: Segmented) -> None:
+    cut = seg.rows[10][2] + 2048
+    clean, _ = seg.build([0, cut, seg.size])
+    seg.site.requests.clear()
+    seg.site.drops = [50_000, 0, 7, 100_000]
+    parts = seg.tmp / "dropped"
+    part = _build.build_part(
+        SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(cut, seg.size)
+    )
+    etag = seg.site.etags[SEG]
+    assert seg.site.gets(SEG) == [
+        ("GET", SEG, f"bytes={cut}-", None),
+        ("GET", SEG, f"bytes={cut + 50_000}-", etag),
+        ("GET", SEG, f"bytes={cut + 50_000}-", etag),
+        ("GET", SEG, f"bytes={cut + 50_007}-", etag),
+        ("GET", SEG, f"bytes={cut + 150_007}-", etag),
+    ]
+    dropped, reference = read_part(part), read_part(clean / part.name)
+    assert dropped[:3] == reference[:3]
+    assert dropped[3]["reconnects"] == 4
+    assert {**dropped[3], "reconnects": 0} == reference[3]
+
+
+def test_segment_stops_if_the_tar_changes(seg: Segmented) -> None:
+    seg.site.drops = [30_000]
+    seg.site.change_etag_after = len([r for r in seg.site.requests if r[0] == "GET"]) + 1
+    with pytest.raises(_build.TarChangedError):
+        _build.build_part(
+            SEG, seg.tmp / "x", base_url=seg.site.base_url, segment=(2, 2),
+            bounds=(seg.header(6), seg.size),
+        )
+    assert list((seg.tmp / "x").iterdir()) == []
+
+
+def test_segment_bounds_must_lie_inside_the_tar(seg: Segmented) -> None:
+    for bounds in ((seg.size, seg.size + 512), (4096, 4096), (8192, 4096)):
+        with pytest.raises(ValueError, match="empty byte range"):
+            _build.build_part(
+                SEG, seg.tmp / "x", base_url=seg.site.base_url, segment=(2, 2), bounds=bounds
+            )
+    with pytest.raises(ValueError):
+        _build.build_part(SEG, seg.tmp / "x", base_url=seg.site.base_url, bounds=(0, 512))
+    with pytest.raises(ValueError):
+        _build.build_part(SEG, seg.tmp / "x", base_url=seg.site.base_url, segment=(3, 2))
+
+
+def test_segment_helpers() -> None:
+    gib = 1024**3
+    assert _build.segment_count(1) == 1
+    assert _build.segment_count(_build.SEGMENT_THRESHOLD_BYTES) == 1
+    assert _build.segment_count(_build.SEGMENT_THRESHOLD_BYTES + 1) == 2
+    assert _build.segment_count(40_062_921_728) == 10
+    assert _build.segment_count(28_580_050_944) == 7
+    assert _build.SEGMENT_BYTES == 4 * gib
+    for size in (512, 10_240, 173_476_864, 40_062_921_728):
+        for count in (1, 2, 3, 7, 10):
+            bounds = [_build.segment_bounds(size, k, count) for k in range(1, count + 1)]
+            assert bounds[0][0] == 0 and bounds[-1][1] == size
+            assert all(a[1] == b[0] for a, b in zip(bounds, bounds[1:]))
+            assert all(start % 512 == 0 and start <= end for start, end in bounds)
+            if size > 10**9:
+                assert max(end - start for start, end in bounds) <= size // count + 512
+    assert _build.part_file_name("x_v6.tar") == "x_v6.tar.tsv.gz"
+    assert _build.part_file_name("x_v6.tar", (3, 10)) == "x_v6.tar.seg03of10.tsv.gz"
+    assert _build.part_file_name("x_v6.tar", (7, 120)) == "x_v6.tar.seg007of120.tsv.gz"
+
+
+# -- false headers inside member data
+
+
+def _header_block(name: str, size: int) -> bytes:
+    info = tarfile.TarInfo(name)
+    info.size = size
+    return info.tobuf(format=tarfile.GNU_FORMAT)
+
+
+def _planted(kind: str) -> bytes:
+    """Bytes for a member that carry something header-like at offset 1536."""
+    rng = random.Random(kind)
+    prefix = rng.randbytes(512 * 3)
+    fake_name = "AF-FAKE0-F1-model_v6.cif.gz"
+    if kind == "magic_only":  # ustar magic at the right place, checksum wrong
+        block = bytearray(rng.randbytes(512))
+        block[257:263] = b"ustar\x00"
+        return prefix + bytes(block) + rng.randbytes(512 * 4)
+    if kind == "valid_header_wrong_name":
+        return prefix + _header_block("README.txt", 512 * 2) + b"\x1f\x8b\x08" + rng.randbytes(2045)
+    if kind == "valid_header_no_gzip_data":  # chains to the real next header
+        return prefix + _header_block(fake_name, 512 * 4) + b"\x00\x01" + rng.randbytes(2046)
+    if kind == "valid_header_broken_chain":  # gzip magic, but nothing valid follows
+        return prefix + _header_block(fake_name, 512 * 2) + b"\x1f\x8b\x08" + rng.randbytes(2045)
+    if kind == "perfect_forgery":  # gzip magic and a size that lands on the real next header
+        return prefix + _header_block(fake_name, 512 * 4) + b"\x1f\x8b\x08" + rng.randbytes(2045)
+    raise AssertionError(kind)
+
+
+VICTIM = ("AF-G0006-F1", "cif")
+
+
+def _planted_tar(site: Site, tmp_path: Path, kind: str) -> tuple[Segmented, int]:
+    payload = _planted(kind)
+    assert len(payload) == 512 * 8
+    tar = make_tar(entry_ids("G", 24), extras=False, seed=11, raw={VICTIM: payload})
+    s = Segmented(site, tmp_path, tar, 24)
+    data = next(r[2] for r in s.rows if (r[0], r[1]) == VICTIM)
+    assert s.tar.data[data + 1536 + 257 :][:5] == b"ustar"
+    return s, data
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["magic_only", "valid_header_wrong_name", "valid_header_no_gzip_data",
+     "valid_header_broken_chain"],
+)
+def test_false_header_in_member_data_is_not_accepted(
+    site: Site, tmp_path: Path, kind: str
+) -> None:
+    s, data = _planted_tar(site, tmp_path, kind)
+    # The second segment starts inside the member, just before the fake header.
+    parts, trailers = s.build([0, data + 512, s.size])
+    assert trailers[1]["first_header"] == data + 512 * 8  # the real next header
+    assert s.merged(parts) == s.expected
+    assert not any(r[0] == "AF-FAKE0-F1" for r in s.expected[1])
+
+
+def test_a_forged_header_that_fools_the_resync_cannot_be_merged(
+    site: Site, tmp_path: Path
+) -> None:
+    s, data = _planted_tar(site, tmp_path, "perfect_forgery")
+    parts, trailers = s.build([0, data + 512, s.size])
+    fake, real = data + 1536, data + 512 * 8
+    # The builder on its own cannot tell: the forgery passes every local test.
+    assert trailers[1]["first_header"] == fake
+    assert "AF-FAKE0-F1" in {r[0] for r in read_part(sorted(parts.iterdir())[1])[1]}
+    assert trailers[0]["stop"] == real
+    # The merge can, because segment 1 walked the real chain of members.
+    out = tmp_path / "forged.sqlite"
+    with pytest.raises(_build.MergeError) as caught:
+        _build.merge_parts(parts, out, metadata=s.metadata)
+    assert (
+        f"segment 1/2 stopped at the member header at byte {real} but segment 2/2 "
+        f"starts at the header at byte {fake}: an overlap of {real - fake} bytes"
+    ) in str(caught.value)
+    assert not out.exists()
+
+
+# -- merge refuses segments that do not tile the tar
+
+
+def _segment_merge_error(s: Segmented, parts: Path) -> str:
+    out = s.tmp / "never" / "index-v6.sqlite"
+    with pytest.raises(_build.MergeError) as caught:
+        _build.merge_parts(parts, out, metadata=s.metadata)
+    assert not out.exists() and not list(out.parent.iterdir())
+    return str(caught.value)
+
+
+def test_merge_fails_on_a_missing_segment(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.header(30), seg.size])
+    (parts / f"{SEG}.seg02of03.tsv.gz").unlink()
+    assert "segment 2 of 3 missing" in _segment_merge_error(seg, parts)
+
+
+def test_merge_fails_on_a_gap_between_segments(seg: Segmented) -> None:
+    a, b = seg.header(8), seg.header(12)
+    parts = seg.tmp / "gap"
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(1, 2), bounds=(0, a))
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(b, seg.size))
+    message = _segment_merge_error(seg, parts)
+    assert (
+        f"segment 1/2 stopped at the member header at byte {a} but segment 2/2 "
+        f"starts at the header at byte {b}: a gap of {b - a} bytes"
+    ) in message
+
+
+def test_merge_fails_on_overlapping_segments(seg: Segmented) -> None:
+    a, b = seg.header(8), seg.header(12)
+    parts = seg.tmp / "overlap"
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(1, 2), bounds=(0, b))
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(a, seg.size))
+    message = _segment_merge_error(seg, parts)
+    assert f"stopped at the member header at byte {b}" in message
+    assert f"starts at the header at byte {a}: an overlap of {b - a} bytes" in message
+
+
+def test_merge_fails_when_the_last_segment_stops_early(seg: Segmented) -> None:
+    a, b = seg.header(8), seg.header(40)
+    parts = seg.tmp / "short"
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(1, 2), bounds=(0, a))
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(a, b))
+    message = _segment_merge_error(seg, parts)
+    assert f"segment 2/2 stopped at byte {b} without reaching the end of the archive" in message
+
+
+def test_merge_fails_when_the_first_segment_does_not_start_at_zero(seg: Segmented) -> None:
+    a, b = seg.header(4), seg.header(8)
+    parts = seg.tmp / "late"
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(1, 2), bounds=(a, b))
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(b, seg.size))
+    message = _segment_merge_error(seg, parts)
+    assert f"segment 1/2 starts at header offset {a}, expected 0" in message
+
+
+def test_merge_fails_when_a_later_segment_claims_headers_after_the_end(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    # Pretend segment 1 already saw the end of the archive.
+    def claim_end(lines: list[str]) -> list[str]:
+        trailer = json.loads(lines[-1].split("\t", 1)[1])
+        trailer["reached_end"] = True
+        return lines[:-1] + ["#end\t" + json.dumps(trailer)]
+
+    _rewrite_part(parts / f"{SEG}.seg01of02.tsv.gz", claim_end)
+    message = _segment_merge_error(seg, parts)
+    assert "saw the archive end" in message and f"at byte {seg.header(8)}" in message
+
+
+def test_merge_fails_on_segments_from_different_layouts(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    other, _ = seg.build([0, seg.header(8), seg.header(20), seg.size])
+    (parts / f"{SEG}.seg02of02.tsv.gz").unlink()
+    name = f"{SEG}.seg02of03.tsv.gz"
+    (parts / name).write_bytes((other / name).read_bytes())
+    assert "different layouts" in _segment_merge_error(seg, parts)
+
+
+def test_merge_fails_on_whole_part_plus_segments(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    whole = seg.tmp / "whole" / f"{SEG}.tsv.gz"
+    (parts / whole.name).write_bytes(whole.read_bytes())
+    assert "both a whole-tar part and segment parts" in _segment_merge_error(seg, parts)
+
+
+def test_merge_fails_on_segments_of_different_versions_of_the_tar(seg: Segmented) -> None:
+    cut = seg.header(8)
+    parts = seg.tmp / "versions"
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(1, 2), bounds=(0, cut))
+    seg.site.etags[SEG] = '"replaced"'
+    _build.build_part(SEG, parts, base_url=seg.site.base_url, segment=(2, 2), bounds=(cut, seg.size))
+    message = _segment_merge_error(seg, parts)
+    assert "segment 2/2: etag '\"replaced\"' differs from segment 1" in message
+
+
+def test_merge_fails_on_a_segment_that_was_cut_short(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    _rewrite_part(parts / f"{SEG}.seg02of02.tsv.gz", lambda lines: lines[:-1])
+    assert "segment 2/2: no #end line" in _segment_merge_error(seg, parts)
+
+
+def test_merge_fails_on_a_segment_file_holding_another_segment(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    (parts / f"{SEG}.seg02of02.tsv.gz").write_bytes((parts / f"{SEG}.seg01of02.tsv.gz").read_bytes())
+    assert "segment 2/2: header describes segment" in _segment_merge_error(seg, parts)
+
+
+def test_count_rule_applies_to_the_sum_of_segments(seg: Segmented) -> None:
+    parts, _ = seg.build([0, seg.header(8), seg.size])
+    seg.metadata[0]["num_predicted_structures"] = 25
+    message = _segment_merge_error(seg, parts)
+    assert "24 cif members, expected 25" in message and "24 pdb members, expected 25" in message
+
+
+def test_merge_fails_on_rows_out_of_tar_order(corpus: Corpus, tmp_path: Path) -> None:
+    def swap(lines: list[str]) -> list[str]:
+        return [lines[0], lines[2], lines[1]] + lines[3:]
+
+    _rewrite_part(corpus.parts / (B + ".tsv.gz"), swap)
+    _expect_merge_failure(corpus, tmp_path, "rows are not in tar order")
+
+
+def test_merge_fails_on_an_unrecognized_part_file_name(corpus: Corpus, tmp_path: Path) -> None:
+    (corpus.parts / "notes.tsv.gz").write_bytes(b"")
+    _expect_merge_failure(corpus, tmp_path, "notes.tsv.gz: not a part file name")
+
+
+# -- the job plan, with and without parts from an earlier run
+
+
+def test_plan_splits_large_tars_and_reuses_earlier_parts(
+    corpus: Corpus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site, base = corpus.site, corpus.site.base_url
+    size_a = len(corpus.tars[A].data)
+    assert size_a > 200_000 > len(corpus.tars[B].data)
+    monkeypatch.setattr(_build, "SEGMENT_BYTES", 100_000)
+    monkeypatch.setattr(_build, "SEGMENT_THRESHOLD_BYTES", 200_000)
+    n = -(-size_a // 100_000)
+    assert n >= 2
+
+    jobs, reused = _build.plan_jobs(corpus.metadata, base_url=base)
+    assert reused == []
+    assert jobs[:n] == [
+        {"tar": A, "segment": f"{k}/{n}", "part": f"{A}.seg{k:02d}of{n:02d}"}
+        for k in range(1, n + 1)
+    ]
+    assert jobs[n:] == [{"tar": t, "segment": "", "part": t} for t in (B, SC, SP)]
+
+    # Run every job the way the workflow does, each into its own artifact folder.
+    run = tmp_path / "run1"
+    for job in jobs:
+        args = ["build-part", job["tar"], "-o", str(run / f"part-{job['part']}"),
+                "--base-url", base, "--segment", job["segment"]]
+        assert _build.main(args) == 0
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    for path in run.rglob("*.tsv.gz"):
+        (flat / path.name).write_bytes(path.read_bytes())
+    segmented = _build.merge_parts(flat, tmp_path / "a" / "index-v6.sqlite", metadata=corpus.metadata)
+    whole = _build.merge_parts(
+        corpus.parts, tmp_path / "b" / "index-v6.sqlite", metadata=corpus.metadata
+    )
+
+    def members(index: Path) -> list[Any]:
+        conn = sqlite3.connect(index)
+        rows = conn.execute("SELECT * FROM members").fetchall()
+        conn.close()
+        return rows
+
+    assert members(segmented) == members(whole)
+
+    # Everything from that run is reusable: nothing left to build.
+    site.requests.clear()
+    jobs2, reused2 = _build.plan_jobs(
+        corpus.metadata, base_url=base, reuse_dir=run, reuse_out=tmp_path / "reused"
+    )
+    assert jobs2 == []
+    assert sorted(reused2) == sorted(p.name for p in flat.iterdir())
+    assert sorted(p.name for p in (tmp_path / "reused").iterdir()) == sorted(reused2)
+    assert {r[0] for r in site.requests} == {"HEAD"}  # nothing is streamed to decide
+
+    # A whole-tar part stands in for all segments of that tar.
+    jobs3, reused3 = _build.plan_jobs(corpus.metadata, base_url=base, reuse_dir=corpus.parts)
+    assert jobs3 == [] and sorted(reused3) == sorted(f"{t}.tsv.gz" for t in (A, B, SC, SP))
+
+    # A part that was cut short, and parts of a tar that changed, are built again.
+    cut_short = run / f"part-{B}" / f"{B}.tsv.gz"
+    _rewrite_part(cut_short, lambda lines: lines[:-1])
+    site.etags[SC] = '"replaced"'
+    (run / f"part-{A}.seg01of{n:02d}" / f"{A}.seg01of{n:02d}.tsv.gz").unlink()
+    jobs4, reused4 = _build.plan_jobs(corpus.metadata, base_url=base, reuse_dir=run)
+    assert jobs4 == [
+        {"tar": A, "segment": f"1/{n}", "part": f"{A}.seg01of{n:02d}"},
+        {"tar": B, "segment": "", "part": B},
+        {"tar": SC, "segment": "", "part": SC},
+    ]
+    assert len(reused4) == (n - 1) + 1
 
 
 # --------------------------------------------------------------------------
@@ -896,3 +1411,42 @@ def test_live_build_merge_verify_smallest_tar(tmp_path: Path) -> None:
     assert len(rows) == 2 * n and skipped == []
     index = _build.merge_parts(tmp_path / "parts", tmp_path / "index-v6.sqlite", metadata=[entry])
     assert _build.verify_index(index, 10)["passed"] == 10
+
+
+def live_resync(tar: str, offset: int) -> tuple[int, str, int]:
+    """Resynchronize at ``offset`` of a real tar; check the member found there."""
+    start = offset // 512 * 512
+    stream = _build._HTTPTarStream(f"{_build.V6_BASE_URL}/{tar}", start=start)
+    try:
+        look = _build._Lookahead(stream)
+        at = _build._resync(look, start, start + 512, stream.size, tar)
+        assert at is not None
+        info = _build._parse_header(look.peek(at, 512))
+        assert info is not None
+        blob = look.peek(at + 512, info.size)
+        consumed = stream.pos - start
+    finally:
+        stream.close()
+    match = _build._MEMBER_RE.fullmatch(info.name)
+    assert match is not None, info.name
+    text = gzip.decompress(blob).decode()
+    assert _build._check_model_text(match.group(1), match.group(2), text) is None
+    assert consumed < 4 * 1024 * 1024  # a resync costs one member, not a stream
+    return at, info.name, info.size
+
+
+@live
+@pytest.mark.live
+@pytest.mark.parametrize(
+    "tar, offset",
+    [
+        ("swissprot_cif_v6.tar", 4_006_292_480),  # the planned start of segment 2/10
+        ("swissprot_cif_v6.tar", 23_456_789_012),
+        ("swissprot_pdb_v6.tar", 12_248_593_408),  # the planned start of segment 4/7
+        ("swissprot_pdb_v6.tar", 27_999_999_999),
+    ],
+)
+def test_live_resync_inside_swissprot(tar: str, offset: int) -> None:
+    at, name, _ = live_resync(tar, offset)
+    assert at >= offset // 512 * 512
+    assert name.endswith(tar.split("_")[1] + ".gz")

@@ -14,6 +14,12 @@ on:
         description: Rebuild even if no tar changed on the EBI server
         type: boolean
         default: true
+      reuse_run:
+        description: >-
+          Optional id of an earlier run of this workflow. Parts it finished
+          are reused instead of being streamed from EBI again.
+        type: string
+        default: ''
   schedule:
     - cron: '17 4 * * 1'
 
@@ -33,9 +39,14 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      # Needed to download the artifacts of the run named by reuse_run.
+      actions: read
     outputs:
       rebuild: ${{ steps.plan.outputs.rebuild }}
-      tars: ${{ steps.plan.outputs.tars }}
+      jobs: ${{ steps.plan.outputs.jobs }}
+      n_jobs: ${{ steps.plan.outputs.n_jobs }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,43 +59,84 @@ jobs:
         run: |
           gh release download index-v6 --pattern index-v6.json --dir published \
             || echo "no published index-v6.json yet"
-      - name: List the tars and compare them with the published index
+      - name: Download the parts of an earlier run
+        if: github.event_name == 'workflow_dispatch' && inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          case "$REUSE_RUN" in
+            ''|*[!0-9]*) echo "::error::reuse_run must be a run id (digits only)"; exit 1 ;;
+          esac
+          # Artifacts uploaded by the finished jobs of a run can be downloaded
+          # whether that run completed, failed, was cancelled or is still
+          # going. Each artifact lands in its own folder under reuse/.
+          gh run download "$REUSE_RUN" --pattern 'part-*' --dir reuse
+          find reuse -name '*.tsv.gz' | sort
+      - name: List the build jobs
         id: plan
         env:
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '--force' || '' }}
-        run: python -m scigantic_alphafold._build plan --published published/index-v6.json $FORCE
+          # A scheduled run never starts the first build: with no published
+          # index it would stream all 153 GB again every week until one
+          # build succeeds. Only a manual run may do that.
+          SCHEDULED: ${{ github.event_name == 'schedule' && '--scheduled' || '' }}
+        run: >-
+          python -m scigantic_alphafold._build plan
+          --published published/index-v6.json
+          --reuse-dir reuse --reuse-out reused
+          $FORCE $SCHEDULED
+      - name: Keep the reused parts with this run
+        uses: actions/upload-artifact@v4
+        with:
+          # Matches the part-* pattern of the publish job, and of a later run
+          # that names this one in reuse_run.
+          name: part-reused
+          path: reused/*.tsv.gz
+          if-no-files-found: ignore
+          retention-days: 7
 
   build:
     needs: plan
-    if: needs.plan.outputs.rebuild == 'true'
+    if: needs.plan.outputs.rebuild == 'true' && needs.plan.outputs.n_jobs != '0'
+    name: ${{ matrix.part }}
     runs-on: ubuntu-latest
-    # The ceiling for a hosted runner is 360 minutes. swissprot_cif_v6.tar is
-    # 40.1 GB, so it needs a sustained 1.9 MB/s to finish inside 350 minutes.
+    # The ceiling for a hosted runner is 360 minutes. A hosted runner measured
+    # about 1.2 MB/s per stream from EBI, so tars above 6 GiB are split into
+    # segments of at most 4 GiB (about an hour each); the largest job is then
+    # the 5.2 GB human proteome, a little over an hour.
     timeout-minutes: 350
     strategy:
       fail-fast: false
       # Eight streams at most, to be polite to the EBI server.
       max-parallel: 8
       matrix:
-        tar: ${{ fromJSON(needs.plan.outputs.tars) }}
+        include: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Stream ${{ matrix.tar }} and write its part file
+      - name: Stream the tar, or one segment of it, and write the part file
         env:
           TAR: ${{ matrix.tar }}
-        run: python -m scigantic_alphafold._build build-part "$TAR" -o parts
+          # Empty for a whole tar, otherwise for example 3/10.
+          SEGMENT: ${{ matrix.segment }}
+        run: python -m scigantic_alphafold._build build-part "$TAR" -o parts --segment "$SEGMENT"
       - uses: actions/upload-artifact@v4
         with:
-          name: part-${{ matrix.tar }}
+          name: part-${{ matrix.part }}
           path: parts/*.tsv.gz
           if-no-files-found: error
           retention-days: 7
 
   publish:
     needs: [plan, build]
+    # The build job is skipped when every part was reused.
+    if: >-
+      always() && needs.plan.outputs.rebuild == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -96,10 +148,11 @@ jobs:
           python-version: '3.12'
       - uses: actions/download-artifact@v4
         with:
+          # The parts built by this run plus part-reused from the plan job.
           pattern: part-*
           path: parts
           merge-multiple: true
-      - name: Merge the parts (fails if a tar is missing or a count is off)
+      - name: Merge the parts (fails on a missing tar, a wrong count or segments that do not tile)
         run: python -m scigantic_alphafold._build merge parts -o index-v6.sqlite
       - name: Read members back from EBI with the new index
         run: python -m scigantic_alphafold._build verify index-v6.sqlite -n 20 --per-tar 2
@@ -109,17 +162,68 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TARGET: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          api="repos/$GH_REPO/releases"
+
           if ! gh release view index-v6 >/dev/null 2>&1; then
-            gh release create index-v6 --latest=false \
-              --target "${{ github.sha }}" \
+            gh release create index-v6 --latest=false --target "$TARGET" \
               --title "AlphaFold DB v6 offset index" \
               --notes "Byte-offset index for the AlphaFold DB v6 bulk tars at EBI. Rebuilt by the Build index workflow whenever a tar changes; index-v6.json says when and from which tars."
           fi
+
+          asset_id() {  # id of the release asset with exactly this name, or nothing
+            gh api "$api/tags/index-v6" --jq ".assets[] | select(.name == \"$1\") | .id"
+          }
+
+          # "gh release upload --clobber" deletes the existing asset and then
+          # uploads, so a failed upload would leave the download URL dead.
+          # Instead: upload under a temporary name, check what arrived, and
+          # only then swap names. The live name is missing only for the
+          # moment between two rename calls, and never during an upload.
+          replace_asset() {
+            local name="$1" new="$1.new" old="$1.old" new_id old_id
+            # A run that died between the two renames left the good asset as .old.
+            if [ -z "$(asset_id "$name")" ] && [ -n "$(asset_id "$old")" ]; then
+              gh api -X PATCH "$api/assets/$(asset_id "$old")" -f name="$name" >/dev/null
+            fi
+            cp "$name" "$new"
+            gh release upload index-v6 "$new" --clobber
+            rm -rf check
+            gh release download index-v6 --pattern "$new" --dir check
+            if ! cmp "check/$new" "$name"; then
+              echo "::error::$new on the release differs from the file that was built; $name was left as it was"
+              exit 1
+            fi
+            new_id="$(asset_id "$new")"
+            old_id="$(asset_id "$old")"
+            if [ -n "$old_id" ]; then gh api -X DELETE "$api/assets/$old_id"; fi
+            old_id="$(asset_id "$name")"
+            if [ -n "$old_id" ]; then
+              gh api -X PATCH "$api/assets/$old_id" -f name="$old" >/dev/null
+            fi
+            if ! gh api -X PATCH "$api/assets/$new_id" -f name="$name" >/dev/null; then
+              if [ -n "$old_id" ]; then
+                gh api -X PATCH "$api/assets/$old_id" -f name="$name" >/dev/null
+              fi
+              echo "::error::could not put the new $name in place; the previous one was restored"
+              exit 1
+            fi
+            if [ -n "$old_id" ]; then gh api -X DELETE "$api/assets/$old_id"; fi
+            echo "published $name"
+          }
+
           # The summary goes last: the scheduled run reads it to decide
           # whether the published index is current.
-          gh release upload index-v6 index-v6.sqlite.gz --clobber
-          gh release upload index-v6 index-v6.json --clobber
+          replace_asset index-v6.sqlite.gz
+          replace_asset index-v6.json
+
+          # Fail loudly if the public URLs do not serve what was built.
+          rm -rf check
+          gh release download index-v6 --pattern index-v6.sqlite.gz --pattern index-v6.json --dir check
+          cmp check/index-v6.sqlite.gz index-v6.sqlite.gz
+          cmp check/index-v6.json index-v6.json
       - uses: actions/upload-artifact@v4
         with:
           name: index-v6

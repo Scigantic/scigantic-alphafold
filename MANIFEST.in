@@ -1,0 +1,6 @@
+include LICENSE README.md CHANGELOG.md
+# The tests need their shared fixtures to run from an unpacked sdist.
+include tests/conftest.py
+recursive-include tests *.py
+prune build
+prune dist

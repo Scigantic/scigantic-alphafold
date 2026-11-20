@@ -162,14 +162,19 @@ def read_member(member: Member, tar: Tar, *, timeout: float = DEFAULT_TIMEOUT) -
     raise FetchError(f"Gave up on {member.url} after {_MAX_ATTEMPTS} attempts: {failure}")
 
 
-def _read(index: Index, id: str, fmt: str, timeout: float) -> tuple[Member, bytes, bytes]:
+def _read(index: Index, id: str, fmt: str | None, timeout: float) -> tuple[Member, bytes, bytes]:
     member = index.resolve(id, fmt)
     raw, text = read_member(member, index.tar(member.tar), timeout=timeout)
     return member, raw, text
 
 
-def fetch(id: str, fmt: str = "cif", *, timeout: float = DEFAULT_TIMEOUT) -> str:
+def fetch(id: str, fmt: str | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     """The structure file as text (mmCIF by default, ``fmt="pdb"`` for PDB).
+
+    ``fmt`` left out means ``"cif"``, unless ``id`` is a file name with an extension
+    (``AF-P69905-F1-model_v6.pdb.gz``), in which case the extension decides. A ``fmt``
+    that contradicts the extension, or a file name of another AlphaFold DB version
+    (``...-model_v4.cif``), raises :class:`InvalidIdError`.
 
     ``id`` is a UniProt accession (``P69905``), an isoform accession (``P12345-2``) or an
     entry id (``AF-P69905-F1``), in any letter case. A bare accession means its single
@@ -179,15 +184,18 @@ def fetch(id: str, fmt: str = "cif", *, timeout: float = DEFAULT_TIMEOUT) -> str
     return _read(_index.get_index(), id, fmt, timeout)[2].decode("utf-8")
 
 
-def fetch_bytes(id: str, fmt: str = "cif", *, timeout: float = DEFAULT_TIMEOUT) -> bytes:
-    """The ``.cif.gz`` or ``.pdb.gz`` exactly as stored in the tar (checked to gunzip)."""
+def fetch_bytes(id: str, fmt: str | None = None, *, timeout: float = DEFAULT_TIMEOUT) -> bytes:
+    """The ``.cif.gz`` or ``.pdb.gz`` exactly as stored in the tar (checked to gunzip).
+
+    ``fmt`` follows the same rule as in :func:`fetch`.
+    """
     return _read(_index.get_index(), id, fmt, timeout)[1]
 
 
 def download(
     id: str,
     out_dir: str | os.PathLike[str] = ".",
-    fmt: str = "cif",
+    fmt: str | None = None,
     decompress: bool = True,
     *,
     timeout: float = DEFAULT_TIMEOUT,
@@ -196,6 +204,8 @@ def download(
 
     The file is written under a temporary name in ``out_dir`` and renamed into place, so
     a reader never sees a partial file. ``out_dir`` is created if it does not exist.
+    ``fmt`` follows the same rule as in :func:`fetch`. The file name is built from the
+    entry id and version in the index, both checked to be plain (no path separators).
     """
     index = _index.get_index()
     member, raw, text = _read(index, id, fmt, timeout)
@@ -221,7 +231,7 @@ def download(
 
 def fetch_many(
     ids: Iterable[str],
-    fmt: str = "cif",
+    fmt: str | None = None,
     workers: int = DEFAULT_WORKERS,
     *,
     on_error: str = "raise",
@@ -241,7 +251,8 @@ def fetch_many(
     """
     if on_error not in ("raise", "skip"):
         raise ValueError(f"on_error must be 'raise' or 'skip', got {on_error!r}")
-    _index.check_fmt(fmt)
+    if fmt is not None:
+        _index.check_fmt(fmt)
     wanted = list(dict.fromkeys([ids] if isinstance(ids, str) else ids))
     if not wanted:
         return {}

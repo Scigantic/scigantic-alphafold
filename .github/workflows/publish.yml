@@ -1,12 +1,15 @@
 name: Publish to PyPI
 
-# Publishes on a version tag (v0.1.0), or on manual dispatch, using the PYPI_KEY
-# token secret (same pattern as scigantic-nci, scigantic-pubchem, scigantic-chembl).
-# Gated on the offline tests and the type check passing.
+# Publishes on a version tag (v0.1.0) using the PYPI_KEY token secret (same pattern as
+# scigantic-nci, scigantic-pubchem, scigantic-chembl). Gated on the offline tests and the
+# type check passing, and on the tag being exactly "v" + the version in _version.py.
+# There is no manual trigger: a manual run could publish from any branch.
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -44,6 +47,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: The tag must be v<version>
+        shell: bash
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/scigantic_alphafold/_version.py)
+          if [ -z "$version" ]; then
+            echo "::error::could not read __version__ from src/scigantic_alphafold/_version.py"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::ref $GITHUB_REF_TYPE '$GITHUB_REF_NAME' is not the tag v$version; nothing was published"
+            exit 1
+          fi
       - name: Build
         run: |
           python -m pip install --upgrade pip build twine

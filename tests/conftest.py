@@ -225,6 +225,16 @@ class Afdb:
             self.monkeypatch.setenv(_index.ENV_INDEX, str(source))
         _index.reset()
 
+    def edit_index(self, name: str, *statements: str) -> Path:
+        """A copy of the index with some SQL applied, for tests of damaged or hostile indexes."""
+        path = self.write_index(self.root / name)
+        conn = sqlite3.connect(path)
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+        conn.close()
+        return path
+
     def write_index(self, path: Path, *, schema_version: str = "1", etags: dict[str, str] | None = None) -> Path:
         if path.exists():
             path.unlink()
@@ -284,6 +294,9 @@ def afdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Afdb]:
     server.files["/index/index-v6.sqlite.gz"] = gzip.compress(plain)
 
     monkeypatch.setenv(_index.ENV_CACHE, str(db.cache_dir))
+    # The synthetic tars are served over plain http from 127.0.0.1, not from EBI.
+    monkeypatch.setenv(_index.ENV_ALLOW_ANY_HOST, "1")
+    monkeypatch.setattr(_index, "_sleep", lambda seconds: None)
     monkeypatch.setenv(_index.ENV_INDEX, str(db.index_path))
     monkeypatch.setattr(_fetch, "_sleep", db.sleeps.append)
     _index.reset()

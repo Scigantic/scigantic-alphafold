@@ -55,6 +55,12 @@ __all__ = [
     "verify_index",
     "write_summary",
     "needs_rebuild",
+    "plan_jobs",
+    "segment_count",
+    "segment_bounds",
+    "part_file_name",
+    "SEGMENT_BYTES",
+    "SEGMENT_THRESHOLD_BYTES",
     "fetch_download_metadata",
     "main",
 ]
@@ -81,6 +87,15 @@ _BUFSIZE = 64 * 1024
 #: Upper bound on reconnects for one tar, whatever progress is being made.
 _MAX_TOTAL_RECONNECTS = 500
 _MAX_BACKOFF_SECONDS = 60.0
+
+#: Tars larger than the threshold are built in parallel byte-range segments of
+#: at most SEGMENT_BYTES each. A hosted runner measured about 1.2 MB/s per
+#: stream from EBI (2026-11-20), so 4 GiB is roughly an hour per job.
+SEGMENT_BYTES = 4 * 1024**3
+SEGMENT_THRESHOLD_BYTES = 6 * 1024**3
+#: A segment looks at most this far past its end for the next member header,
+#: and does not accept a resynchronization candidate larger than this.
+_RESYNC_LIMIT = 64 * 1024 * 1024
 
 #: Tars whose member count is known to differ from ``num_predicted_structures``
 #: in download_metadata.json, as ``{tar name: {fmt: expected member count}}``.
@@ -193,13 +208,21 @@ class _HTTPTarStream:
     """
 
     def __init__(
-        self, url: str, *, timeout: float = 60.0, max_retries: int = 8, backoff: float = 2.0
+        self,
+        url: str,
+        *,
+        start: int = 0,
+        timeout: float = 60.0,
+        max_retries: int = 8,
+        backoff: float = 2.0,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.max_retries = max_retries
         self.backoff = backoff
-        self.pos = 0
+        #: First byte this stream serves; a segment starts in the middle.
+        self.start = start
+        self.pos = start
         self.size = -1
         self.etag: str | None = None
         self.last_modified: str | None = None
@@ -216,7 +239,7 @@ class _HTTPTarStream:
         headers: dict[str, str] = {}
         if self.pos > 0:
             headers["Range"] = f"bytes={self.pos}-"
-            if self.etag and not self.etag.startswith("W/"):
+            if self.size >= 0 and self.etag and not self.etag.startswith("W/"):
                 headers["If-Range"] = self.etag
         resp = _open(_request(self.url, headers=headers), self.timeout)
         try:
@@ -229,36 +252,45 @@ class _HTTPTarStream:
     def _check(self, resp: http.client.HTTPResponse) -> None:
         etag = resp.headers.get("ETag")
         last_modified = resp.headers.get("Last-Modified")
-        if self.pos == 0 and self.size < 0:
-            if resp.status != 200:
-                raise BuildError(f"{self.url}: expected HTTP 200, got {resp.status}")
-            length = resp.headers.get("Content-Length")
-            if length is None:
-                raise BuildError(f"{self.url}: response has no Content-Length")
-            self.size = int(length)
-            self.etag = etag
-            self.last_modified = last_modified
-            return
-        if etag != self.etag or last_modified != self.last_modified:
+        first = self.size < 0
+        if not first and (etag != self.etag or last_modified != self.last_modified):
             raise TarChangedError(
                 f"{self.url} changed during the build: ETag {self.etag!r} -> {etag!r}, "
                 f"Last-Modified {self.last_modified!r} -> {last_modified!r}"
             )
+        problem: type[BuildError] = BuildError if first else TarChangedError
         if self.pos == 0:
-            # Reconnect before the first byte was read: a plain 200 again.
-            if resp.status != 200 or int(resp.headers.get("Content-Length", "-1")) != self.size:
-                raise TarChangedError(f"{self.url}: size changed during the build")
-            return
-        if resp.status != 206:
+            if resp.status != 200:
+                raise problem(f"{self.url}: expected HTTP 200, got {resp.status}")
+            length = resp.headers.get("Content-Length")
+            if length is None:
+                raise BuildError(f"{self.url}: response has no Content-Length")
+            total = int(length)
+        else:
+            if resp.status != 206:
+                raise problem(
+                    f"{self.url}: asked for bytes from {self.pos} and got HTTP {resp.status} "
+                    "instead of 206; the server does not serve this file by range"
+                )
+            content_range = resp.headers.get("Content-Range", "").strip()
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+            if (
+                match is None
+                or int(match.group(1)) != self.pos
+                or int(match.group(2)) != int(match.group(3)) - 1
+            ):
+                raise problem(
+                    f"{self.url}: Content-Range {content_range!r}, "
+                    f"expected bytes {self.pos}-<last>/<size>"
+                )
+            total = int(match.group(3))
+        if first:
+            self.size = total
+            self.etag = etag
+            self.last_modified = last_modified
+        elif total != self.size:
             raise TarChangedError(
-                f"{self.url}: asked for bytes from {self.pos} and got HTTP {resp.status} "
-                "instead of 206; the server no longer serves the same file by range"
-            )
-        content_range = resp.headers.get("Content-Range", "")
-        expected = f"bytes {self.pos}-{self.size - 1}/{self.size}"
-        if content_range.strip() != expected:
-            raise TarChangedError(
-                f"{self.url}: Content-Range {content_range!r}, expected {expected!r}"
+                f"{self.url}: size changed during the build, {self.size} -> {total}"
             )
 
     def _disconnect(self) -> None:
@@ -350,17 +382,151 @@ def _clean(name: str) -> str:
     return name.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 
+def _align_up(n: int) -> int:
+    return (n + 511) // 512 * 512
+
+
+def segment_count(size: int) -> int:
+    """Number of segments a tar of ``size`` bytes is built in (1: not split)."""
+    if size <= SEGMENT_THRESHOLD_BYTES:
+        return 1
+    return -(-size // SEGMENT_BYTES)
+
+
+def segment_bounds(size: int, index: int, count: int) -> tuple[int, int]:
+    """Byte range of segment ``index`` (1-based) of ``count`` equal segments."""
+    if count < 1 or not 1 <= index <= count:
+        raise ValueError(f"no segment {index} of {count}")
+    start = min(_align_up(size * (index - 1) // count), size)
+    end = size if index == count else min(_align_up(size * index // count), size)
+    return start, end
+
+
+def part_file_name(tar: str, segment: tuple[int, int] | None = None) -> str:
+    """``<tar>.tsv.gz`` or, for a segment, ``<tar>.seg03of10.tsv.gz``."""
+    if segment is None:
+        return tar + _PART_SUFFIX
+    index, count = segment
+    width = max(2, len(str(count)))
+    return f"{tar}.seg{index:0{width}d}of{count:0{width}d}{_PART_SUFFIX}"
+
+
+def _parse_header(block: bytes) -> tarfile.TarInfo | None:
+    """A tar header block with ustar magic and a valid checksum, or None."""
+    if len(block) != 512 or block[257:262] != b"ustar":
+        return None
+    try:
+        return tarfile.TarInfo.frombuf(block, "utf-8", "surrogateescape")
+    except tarfile.TarError:
+        return None
+
+
+def _is_model(info: tarfile.TarInfo) -> bool:
+    return info.isreg() and info.size > 0 and _MEMBER_RE.fullmatch(info.name) is not None
+
+
+class _Lookahead:
+    """Reader over a stream that can look at bytes before handing them on.
+
+    The resynchronization needs to inspect a candidate header, the first bytes
+    of its data and the block after the member before the tar parser is
+    allowed to start there. Whatever was looked at stays buffered and is
+    served first by :meth:`read`.
+    """
+
+    def __init__(self, stream: _HTTPTarStream) -> None:
+        self.stream = stream
+        self.base = stream.pos
+        self.buf = bytearray()
+
+    def fill(self, upto: int) -> bool:
+        """Buffer up to absolute offset ``upto``. False if the file ends first."""
+        while self.base + len(self.buf) < upto:
+            chunk = self.stream.read(_BUFSIZE)
+            if not chunk:
+                return False
+            self.buf += chunk
+        return True
+
+    def peek(self, offset: int, n: int) -> bytes:
+        self.fill(offset + n)
+        at = offset - self.base
+        return bytes(self.buf[at : at + n])
+
+    def drop_before(self, offset: int) -> None:
+        del self.buf[: offset - self.base]
+        self.base = offset
+
+    def read(self, n: int = -1) -> bytes:
+        if self.buf:
+            out = bytes(self.buf if n is None or n < 0 else self.buf[:n])
+            del self.buf[: len(out)]
+            self.base += len(out)
+            return out
+        chunk = self.stream.read(n)
+        self.base += len(chunk)
+        return chunk
+
+
+def _resync(look: _Lookahead, start: int, end: int, total: int, what: str) -> int | None:
+    """Offset of the first model member header at or after ``start``.
+
+    ``start`` is 512-aligned but normally lands inside some member's data.
+    Tar headers sit on 512-byte boundaries, so every following block is tried
+    as a header. A block is accepted only if all of this holds:
+
+    * ustar magic and a valid header checksum;
+    * a regular file whose name matches the model naming;
+    * the member's data starts with the gzip magic;
+    * the block right after the member is another valid header, the zero
+      block that ends the archive, or the end of the file.
+
+    Magic alone would be easy to hit inside compressed data; the checksum,
+    the name pattern and the follow-on block together are not. The merge
+    still does not take this on trust: it requires the previous segment to
+    have stopped at exactly the offset returned here.
+
+    Returns None when the file ends before any such header (the segment
+    starts in the last member or in the end-of-archive padding). Gives up
+    with :class:`BuildError` if no header shows up within ``_RESYNC_LIMIT``
+    bytes past ``end``, so a segment never reads far beyond its range.
+    """
+    zero = bytes(512)
+    pos = start
+    while pos + 512 <= total:
+        if pos >= end + _RESYNC_LIMIT:
+            raise BuildError(
+                f"{what}: no member header found between byte {start} and byte {pos}, "
+                f"{_RESYNC_LIMIT} bytes past the end of the segment"
+            )
+        look.drop_before(pos)
+        info = _parse_header(look.peek(pos, 512))
+        if info is not None and _is_model(info) and info.size <= _RESYNC_LIMIT:
+            data = pos + 512
+            after = data + _align_up(info.size)
+            if after == total or after + 512 <= total:
+                follow = look.peek(after, 512) if after < total else zero
+                if look.peek(data, 2) == b"\x1f\x8b" and (
+                    follow == zero or _parse_header(follow) is not None
+                ):
+                    return pos
+        pos += 512
+    return None
+
+
 def build_part(
     tar: str,
     out_dir: str | os.PathLike[str],
     *,
     base_url: str = V6_BASE_URL,
+    segment: tuple[int, int] | None = None,
+    bounds: tuple[int, int] | None = None,
     timeout: float = 60.0,
     max_retries: int = 8,
     backoff: float = 2.0,
     progress_seconds: float = 30.0,
 ) -> Path:
-    """Stream one bulk tar and write ``<out_dir>/<tar>.tsv.gz``.
+    """Stream one bulk tar, or one segment of it, and write its part file.
 
     The tar is never written to disk. For every member the part file records
     the offset of its data bytes (``TarInfo.offset_data``) and its size, which
@@ -370,88 +536,152 @@ def build_part(
     A dropped connection is resumed with a Range request from the byte that
     had been reached (see :class:`_HTTPTarStream`), with at most
     ``max_retries`` consecutive failures and exponential ``backoff``. The part
-    is written under a temporary name and renamed at the end, so a file named
-    ``<tar>.tsv.gz`` is always complete.
+    is written under a temporary name and renamed at the end, so a file with
+    the final name is always complete.
+
+    ``segment=(index, count)`` (1-based) indexes one of ``count`` equal byte
+    ranges of the tar instead, so that a 40 GB tar can be built by several
+    jobs at once. The output is ``<tar>.seg<index>of<count>.tsv.gz``. A segment
+    starts at a 512-aligned offset that is usually inside a member; it finds
+    the first model member header at or after that offset (see
+    :func:`_resync`), parses from there and stops at the first model member
+    header at or past its end. A member therefore belongs to the segment in
+    which its header starts, and a segment reads at most one member (plus one
+    read buffer) beyond its end. ``bounds=(start, end)`` overrides the byte
+    range computed from ``index`` and ``count``; both are rounded up to a
+    multiple of 512.
     """
     name = _tar_name(tar)
     url = base_url.rstrip("/") + "/" + name
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    final = out_path / (name + _PART_SUFFIX)
-    tmp = out_path / f".{name}{_PART_SUFFIX}.{os.getpid()}.tmp"
+    if bounds is not None and segment is None:
+        raise ValueError("bounds needs segment=(index, count)")
+    final = out_path / part_file_name(name, segment)
+    tmp = out_path / f".{final.name}.{os.getpid()}.tmp"
+    label = name if segment is None else f"{name} segment {segment[0]}/{segment[1]}"
 
-    stream = _HTTPTarStream(url, timeout=timeout, max_retries=max_retries, backoff=backoff)
+    start = 0
+    seg_end: int | None = None
+    if segment is not None:
+        known_size = _head(url, timeout=timeout)["size_bytes"]
+        if not isinstance(known_size, int):
+            raise BuildError(f"{url}: HEAD response has no Content-Length")
+        lo, hi = bounds if bounds is not None else segment_bounds(known_size, *segment)
+        start, seg_end = _align_up(lo), min(_align_up(hi), known_size)
+        if not 0 <= start < seg_end:
+            raise ValueError(
+                f"{label}: empty byte range {start}-{seg_end} in a tar of {known_size} bytes"
+            )
+
+    stream = _HTTPTarStream(
+        url, start=start, timeout=timeout, max_retries=max_retries, backoff=backoff
+    )
     counts = {fmt: 0 for fmt in _FORMATS}
     n_skipped = 0
     started = time.monotonic()
     last_report = started
     try:
-        header = {
+        total = stream.size
+        if seg_end is None:
+            seg_end = total
+        elif total != known_size:
+            raise TarChangedError(f"{url}: size changed during the build, {known_size} -> {total}")
+        span = seg_end - start
+        header: dict[str, Any] = {
             "name": name,
             "url": url,
-            "size_bytes": stream.size,
+            "size_bytes": total,
             "last_modified": stream.last_modified,
             "etag": stream.etag,
         }
+        if segment is not None:
+            header["segment"] = {
+                "index": segment[0], "count": segment[1], "start": start, "end": seg_end
+            }
+        look = _Lookahead(stream)
         with open(tmp, "wb") as raw:
             with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as out:
                 out.write(("#" + json.dumps(header, sort_keys=True) + "\n").encode())
-                with tarfile.open(
-                    fileobj=cast(IO[bytes], stream), mode="r|", bufsize=_BUFSIZE
-                ) as archive:
-                    seen: list[tarfile.TarInfo] = getattr(archive, "members")
-                    while True:
-                        member = archive.next()
-                        if member is None:
-                            break
-                        # tarfile keeps every TarInfo it has seen; with half a
-                        # million members that is memory we do not need.
-                        seen.clear()
-                        match = _MEMBER_RE.fullmatch(member.name) if member.isreg() else None
-                        if match is None:
-                            n_skipped += 1
-                            out.write(f"#skipped\t{_clean(member.name)}\n".encode())
-                        else:
-                            if member.size <= 0:
-                                raise BuildError(f"{name}: member {member.name} is empty")
-                            if member.offset_data + member.size > stream.size:
-                                raise BuildError(
-                                    f"{name}: member {member.name} runs past the end of the tar"
+                first_header = 0 if start == 0 else _resync(look, start, seg_end, total, label)
+                stop: int | None = None
+                end_of_members: int | None = None
+                if first_header is not None and first_header >= seg_end:
+                    # No member header starts inside this segment.
+                    stop = first_header
+                elif first_header is not None:
+                    with tarfile.open(
+                        fileobj=cast(IO[bytes], look), mode="r|", bufsize=_BUFSIZE
+                    ) as archive:
+                        seen: list[tarfile.TarInfo] = getattr(archive, "members")
+                        while True:
+                            member = archive.next()
+                            if member is None:
+                                end_of_members = first_header + archive.offset
+                                break
+                            # tarfile keeps every TarInfo it has seen; with half
+                            # a million members that is memory we do not need.
+                            seen.clear()
+                            # Offsets from tarfile count from where it started.
+                            header_at = first_header + member.offset
+                            data_at = first_header + member.offset_data
+                            match = _MEMBER_RE.fullmatch(member.name) if member.isreg() else None
+                            if match is not None and member.size > 0 and header_at >= seg_end:
+                                stop = header_at
+                                break
+                            if match is None:
+                                n_skipped += 1
+                                out.write(f"#skipped\t{_clean(member.name)}\n".encode())
+                            else:
+                                if member.size <= 0:
+                                    raise BuildError(f"{name}: member {member.name} is empty")
+                                if data_at + member.size > total:
+                                    raise BuildError(
+                                        f"{name}: member {member.name} runs past the end of the tar"
+                                    )
+                                entry_id, fmt = match.group(1), match.group(2)
+                                counts[fmt] += 1
+                                out.write(f"{entry_id}\t{fmt}\t{data_at}\t{member.size}\n".encode())
+                            now = time.monotonic()
+                            if now - last_report >= progress_seconds:
+                                last_report = now
+                                done = stream.pos - start
+                                rate = done / max(now - started, 1e-9) / 1e6
+                                _log(
+                                    f"{label}: {done / 1e6:,.0f} of {span / 1e6:,.0f} MB "
+                                    f"({rate:.1f} MB/s), {sum(counts.values()):,} members, "
+                                    f"{stream.reconnects} reconnects"
                                 )
-                            entry_id, fmt = match.group(1), match.group(2)
-                            counts[fmt] += 1
-                            out.write(
-                                f"{entry_id}\t{fmt}\t{member.offset_data}\t{member.size}\n".encode()
-                            )
-                        now = time.monotonic()
-                        if now - last_report >= progress_seconds:
-                            last_report = now
-                            rate = stream.pos / max(now - started, 1e-9) / 1e6
-                            _log(
-                                f"{name}: {stream.pos / 1e6:,.0f} of {stream.size / 1e6:,.0f} MB "
-                                f"({rate:.1f} MB/s), {sum(counts.values()):,} members, "
-                                f"{stream.reconnects} reconnects"
-                            )
-                    end_of_members = archive.offset
-                # tarfile stops quietly at the first block it cannot parse, so
-                # prove that nothing but zero padding follows the last member.
-                while stream.last_nonzero_end <= end_of_members and stream.read(1 << 20):
-                    pass
-                if stream.last_nonzero_end > end_of_members:
-                    raise BuildError(
-                        f"{name}: parsing stopped at byte {end_of_members} but the tar has data "
-                        f"up to byte {stream.last_nonzero_end} (corrupt header or concatenated tar)"
-                    )
-                if stream.pos != stream.size:
-                    raise BuildError(f"{name}: read {stream.pos} bytes of {stream.size}")
-                trailer = {
+                if end_of_members is not None:
+                    # tarfile stops quietly at the first block it cannot parse,
+                    # so prove that nothing but zero padding follows.
+                    while stream.last_nonzero_end <= end_of_members and look.read(1 << 20):
+                        pass
+                    if stream.last_nonzero_end > end_of_members:
+                        raise BuildError(
+                            f"{name}: parsing stopped at byte {end_of_members} but the tar has "
+                            f"data up to byte {stream.last_nonzero_end} "
+                            "(corrupt header or concatenated tar)"
+                        )
+                    if stream.pos != total:
+                        raise BuildError(f"{name}: read up to byte {stream.pos} of {total}")
+                trailer: dict[str, Any] = {
                     "n_cif": counts["cif"],
                     "n_pdb": counts["pdb"],
                     "n_skipped": n_skipped,
-                    "bytes_read": stream.pos,
-                    "end_of_members": end_of_members,
+                    "bytes_read": stream.pos - start,
                     "reconnects": stream.reconnects,
                 }
+                if segment is None:
+                    trailer["end_of_members"] = end_of_members
+                else:
+                    # first_header: where this segment began parsing (None if
+                    # the file ended before any header). stop: the header of
+                    # the next segment's first member, or where the archive
+                    # ends when reached_end is true.
+                    trailer["first_header"] = first_header
+                    trailer["stop"] = stop if stop is not None else end_of_members
+                    trailer["reached_end"] = end_of_members is not None
                 out.write(("#end\t" + json.dumps(trailer, sort_keys=True) + "\n").encode())
             raw.flush()
             os.fsync(raw.fileno())
@@ -463,9 +693,10 @@ def build_part(
         if tmp.exists():
             tmp.unlink()
     elapsed = max(time.monotonic() - started, 1e-9)
+    read = stream.pos - start
     _log(
-        f"{name}: {counts['cif']:,} cif + {counts['pdb']:,} pdb members, {n_skipped} skipped, "
-        f"{stream.size:,} bytes in {elapsed:.0f}s ({stream.size / elapsed / 1e6:.1f} MB/s), "
+        f"{label}: {counts['cif']:,} cif + {counts['pdb']:,} pdb members, {n_skipped} skipped, "
+        f"{read:,} bytes in {elapsed:.0f}s ({read / elapsed / 1e6:.1f} MB/s), "
         f"{stream.reconnects} reconnects -> {final}"
     )
     return final
@@ -510,6 +741,184 @@ def _read_part(path: Path) -> _Part:
     if header is None:
         raise ValueError("empty part file")
     return _Part(header, rows, skipped, trailer)
+
+
+_PART_FILE_RE = re.compile(
+    r"(?P<tar>.+?\.tar)(?:\.seg(?P<index>[0-9]+)of(?P<count>[0-9]+))?" + re.escape(_PART_SUFFIX)
+)
+_Segment = tuple[int, int]
+
+
+def _find_parts(parts_path: Path) -> tuple[dict[str, dict[_Segment | None, Path]], list[str]]:
+    """Part files in a directory as ``{tar: {None or (index, count): path}}``."""
+    found: dict[str, dict[_Segment | None, Path]] = {}
+    unrecognized: list[str] = []
+    for path in sorted(parts_path.glob("*" + _PART_SUFFIX)):
+        if path.name.startswith("."):
+            continue
+        match = _PART_FILE_RE.fullmatch(path.name)
+        if match is None:
+            unrecognized.append(path.name)
+            continue
+        segment = (int(match["index"]), int(match["count"])) if match["index"] else None
+        found.setdefault(match["tar"], {})[segment] = path
+    return found, unrecognized
+
+
+def _read_named(path: Path) -> _Part:
+    try:
+        return _read_part(path)
+    except (OSError, EOFError, ValueError) as exc:
+        raise ValueError(f"unreadable part file {path.name}: {exc}") from exc
+
+
+def _part_problems(part: _Part, name: str, segment: _Segment | None) -> list[str]:
+    """What is wrong with one part file on its own. Empty list: nothing."""
+    problems: list[str] = []
+    if part.header.get("name") != name:
+        problems.append(f"header names {part.header.get('name')!r}")
+    declared = part.header.get("segment")
+    if segment is None:
+        if declared is not None:
+            problems.append("a whole-tar part whose header describes a segment")
+    elif not isinstance(declared, dict) or (
+        declared.get("index"), declared.get("count")
+    ) != segment:
+        problems.append(f"header describes segment {declared!r}")
+    counts = {fmt: sum(1 for row in part.rows if row[1] == fmt) for fmt in _FORMATS}
+    if part.trailer is None:
+        problems.append("no #end line, the part was cut short")
+    elif (
+        part.trailer.get("n_cif") != counts["cif"]
+        or part.trailer.get("n_pdb") != counts["pdb"]
+        or part.trailer.get("n_skipped") != len(part.skipped)
+    ):
+        problems.append(f"rows do not match the #end line {part.trailer}")
+    elif segment is not None:
+        first, stop = part.trailer.get("first_header", ""), part.trailer.get("stop", "")
+        if (
+            not (first is None or isinstance(first, int))
+            or not (stop is None or isinstance(stop, int))
+            or not isinstance(part.trailer.get("reached_end"), bool)
+            or (first is None) != (stop is None)
+        ):
+            problems.append(f"the #end line lacks the segment offsets: {part.trailer}")
+    return problems
+
+
+def _tiling_problems(segments: list[_Part]) -> list[str]:
+    """Prove that consecutive segments cover the tar with no gap or overlap.
+
+    Each segment recorded the offset of the header it started parsing at and
+    the offset of the header it stopped at. A segment's stop was reached by
+    walking the tar member by member from a known header, so it is a real
+    header. Requiring the next segment to have started at exactly that offset
+    means its resynchronization found the same header, and by induction from
+    offset 0 every segment walked the one true chain of members.
+    """
+    count = len(segments)
+    problems: list[str] = []
+    trailers = [cast("dict[str, Any]", part.trailer) for part in segments]
+    if trailers[0]["first_header"] != 0:
+        problems.append(
+            f"segment 1/{count} starts at header offset {trailers[0]['first_header']}, expected 0"
+        )
+    for index, part in enumerate(segments, 1):
+        trailer = trailers[index - 1]
+        first, stop = trailer["first_header"], trailer["stop"]
+        if first is not None and (stop < first or (trailer["reached_end"] and stop == first)):
+            problems.append(f"segment {index}/{count}: stop offset {stop} before start {first}")
+        if part.rows and (
+            first is None or part.rows[0][2] - 512 < first or part.rows[-1][2] + part.rows[-1][3] > stop
+        ):
+            problems.append(
+                f"segment {index}/{count}: rows lie outside its range, bytes {first} to {stop}"
+            )
+        if index == count:
+            if not (trailer["reached_end"] or first is None):
+                problems.append(
+                    f"segment {count}/{count} stopped at byte {stop} "
+                    "without reaching the end of the archive"
+                )
+            break
+        following = trailers[index]["first_header"]
+        pair = f"segment {index}/{count}", f"segment {index + 1}/{count}"
+        if trailer["reached_end"] or first is None:
+            if following is not None:
+                where = f"at byte {stop}" if stop is not None else "before its range"
+                problems.append(
+                    f"{pair[0]} saw the archive end {where} but {pair[1]} "
+                    f"starts at a member header at byte {following}"
+                )
+        elif following is None:
+            problems.append(
+                f"{pair[0]} stopped at the member header at byte {stop} but {pair[1]} "
+                "found no member header before the end of the tar"
+            )
+        elif following != stop:
+            kind = "a gap" if following > stop else "an overlap"
+            problems.append(
+                f"{pair[0]} stopped at the member header at byte {stop} but {pair[1]} "
+                f"starts at the header at byte {following}: {kind} of {abs(following - stop)} bytes"
+            )
+    return problems
+
+
+def _assemble(
+    name: str, files: dict[_Segment | None, Path]
+) -> tuple[_Part | None, list[str], str]:
+    """Load a tar's part, or all of its segments as one part.
+
+    Returns the part (None if it cannot be put together), the problems found
+    and a short description for the summary table.
+    """
+    if None in files:
+        if len(files) > 1:
+            names = ", ".join(sorted(path.name for path in files.values()))
+            return None, [f"both a whole-tar part and segment parts are present: {names}"], "mixed"
+        part = _read_named(files[None])
+        return part, _part_problems(part, name, None), "whole"
+    counts = sorted({segment[1] for segment in files if segment is not None})
+    if len(counts) != 1:
+        return None, [f"segment parts from different layouts are present: of {counts}"], "mixed"
+    count = counts[0]
+    label = f"{count} seg"
+    wanted: list[_Segment] = [(index, count) for index in range(1, count + 1)]
+    missing = [str(segment[0]) for segment in wanted if segment not in files]
+    if missing or len(files) != count:
+        have = ", ".join(sorted(path.name for path in files.values()))
+        return (
+            None,
+            [f"segment {', '.join(missing) or '?'} of {count} missing (present: {have})"],
+            label,
+        )
+    segments = [_read_named(files[segment]) for segment in wanted]
+    problems = [
+        f"segment {segment[0]}/{count}: {problem}"
+        for segment, part in zip(wanted, segments)
+        for problem in _part_problems(part, name, segment)
+    ]
+    if problems:
+        return None, problems, label
+    first = segments[0].header
+    for index, part in enumerate(segments[1:], 2):
+        for key in ("url", "size_bytes", "etag", "last_modified"):
+            if part.header.get(key) != first.get(key):
+                problems.append(
+                    f"segment {index}/{count}: {key} {part.header.get(key)!r} differs from "
+                    f"segment 1 ({first.get(key)!r}); the segments are not of the same file"
+                )
+    problems.extend(_tiling_problems(segments))
+    rows = [row for part in segments for row in part.rows]
+    skipped = [member for part in segments for member in part.skipped]
+    trailer = {
+        "n_cif": sum(1 for row in rows if row[1] == "cif"),
+        "n_pdb": sum(1 for row in rows if row[1] == "pdb"),
+        "n_skipped": len(skipped),
+    }
+    header = {key: value for key, value in first.items() if key != "segment"}
+    return _Part(header, rows, skipped, trailer), problems, label
+
 
 
 # --------------------------------------------------------------------------
@@ -584,7 +993,13 @@ def merge_parts(
       listed in the metadata;
     * a part is unreadable, has no ``#end`` line (the build was cut short) or
       its rows disagree with the counts in that line;
-    * a part has zero rows, or the same (entry id, format) twice;
+    * a tar has zero rows, the same (entry id, format) twice, or rows that
+      are not in increasing, non-overlapping tar order;
+    * a tar built in segments (see :func:`build_part`) has a segment missing,
+      segments of different versions of the file, or segments that do not
+      tile it exactly: segment 1 must start at header offset 0, every
+      segment's stop offset must equal the next one's first header offset,
+      and the last one must have reached the end of the archive;
     * the number of members per format differs from the tar's
       ``num_predicted_structures`` (both formats for proteome and global
       health tars, the one format for each Swiss-Prot tar);
@@ -599,16 +1014,12 @@ def merge_parts(
     if not metadata:
         raise MergeError("the tar list is empty")
 
-    available = {
-        p.name[: -len(_PART_SUFFIX)]: p
-        for p in sorted(parts_path.glob("*" + _PART_SUFFIX))
-        if not p.name.startswith(".")
-    }
+    found, unrecognized = _find_parts(parts_path)
     listed = [str(entry["archive_name"]) for entry in metadata]
-    errors: list[str] = []
+    errors: list[str] = [f"{name}: not a part file name" for name in unrecognized]
     if len(set(listed)) != len(listed):
         errors.append("the tar list names a tar more than once")
-    for name in sorted(set(available) - set(listed)):
+    for name in sorted(set(found) - set(listed)):
         errors.append(f"{name}: part file present but the tar is not in the tar list")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -620,7 +1031,7 @@ def merge_parts(
             stale.unlink()
 
     table: list[list[str]] = [
-        ["tar", "type", "tar bytes", "expected", "cif", "pdb", "skipped", "status"]
+        ["tar", "type", "tar bytes", "parts", "expected", "cif", "pdb", "skipped", "status"]
     ]
     base_urls: set[str] = set()
     total_rows = 0
@@ -636,33 +1047,38 @@ def merge_parts(
             n = int(entry["num_predicted_structures"])
             expected = _expected_counts(name, n)
             expected_text = "/".join(str(expected[fmt]) for fmt in _FORMATS)
-            path = available.get(name)
-            if path is None:
+            files = found.get(name)
+            if not files:
                 errors.append(f"{name}: no part file in {parts_path}")
-                table.append([name, tar_type, "-", expected_text, "-", "-", "-", "MISSING"])
+                table.append([name, tar_type, "-", "-", expected_text, "-", "-", "-", "MISSING"])
                 continue
             try:
-                part = _read_part(path)
-            except (OSError, EOFError, ValueError) as exc:
-                errors.append(f"{name}: unreadable part file {path.name}: {exc}")
-                table.append([name, tar_type, "-", expected_text, "-", "-", "-", "UNREADABLE"])
+                loaded, problems, parts_label = _assemble(name, files)
+            except ValueError as exc:
+                errors.append(f"{name}: {exc}")
+                table.append(
+                    [name, tar_type, "-", "-", expected_text, "-", "-", "-", "UNREADABLE"]
+                )
                 continue
+            if loaded is None:
+                errors.extend(f"{name}: {problem}" for problem in problems)
+                table.append(
+                    [name, tar_type, "-", parts_label, expected_text, "-", "-", "-", "FAILED"]
+                )
+                continue
+            part = loaded
             counts = {fmt: sum(1 for row in part.rows if row[1] == fmt) for fmt in _FORMATS}
-            problems: list[str] = []
-            if part.header.get("name") != name:
-                problems.append(f"header names {part.header.get('name')!r}")
-            if part.trailer is None:
-                problems.append("no #end line, the part was cut short")
-            elif (
-                part.trailer.get("n_cif") != counts["cif"]
-                or part.trailer.get("n_pdb") != counts["pdb"]
-                or part.trailer.get("n_skipped") != len(part.skipped)
-            ):
-                problems.append(f"rows do not match the #end line {part.trailer}")
             if not part.rows:
                 problems.append("zero rows")
             if len({(row[0], row[1]) for row in part.rows}) != len(part.rows):
                 problems.append("the same entry id and format appears more than once")
+            for before, after in zip(part.rows, part.rows[1:]):
+                if before[2] + before[3] > after[2] - 512:
+                    problems.append(
+                        f"rows are not in tar order without overlap: {before[0]} {before[1]} "
+                        f"at bytes {before[2]}+{before[3]}, then {after[0]} {after[1]} at {after[2]}"
+                    )
+                    break
             for fmt in _FORMATS:
                 if counts[fmt] != expected[fmt]:
                     problems.append(
@@ -682,6 +1098,7 @@ def merge_parts(
                     name,
                     tar_type,
                     f"{size:,}" if isinstance(size, int) else "-",
+                    parts_label,
                     expected_text,
                     str(counts["cif"]),
                     str(counts["pdb"]),
@@ -1010,25 +1427,146 @@ def _github_output(values: dict[str, str]) -> None:
                 handle.write(f"{key}={value}\n")
 
 
+def plan_jobs(
+    metadata: list[dict[str, Any]],
+    *,
+    base_url: str = V6_BASE_URL,
+    reuse_dir: str | os.PathLike[str] | None = None,
+    reuse_out: str | os.PathLike[str] | None = None,
+    timeout: float = 60.0,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """The build jobs for a full index: one per tar, or one per segment.
+
+    A tar larger than ``SEGMENT_THRESHOLD_BYTES`` (by the size in the tar
+    list) is split into segments of at most ``SEGMENT_BYTES``. Each job is
+    ``{"tar": ..., "segment": "" or "3/10", "part": part file name without
+    .tsv.gz}``.
+
+    ``reuse_dir`` holds part files of an earlier run (searched recursively).
+    A part found there is reused, and its job left out, when it is complete
+    and was built from the file the server has now (same size, ETag and
+    Last-Modified, one HEAD request per tar). A complete whole-tar part
+    stands in for all segments of that tar. Reused parts are copied to
+    ``reuse_out`` and their file names returned.
+    """
+    candidates: dict[str, Path] = {}
+    if reuse_dir is not None:
+        for path in sorted(Path(reuse_dir).rglob("*" + _PART_SUFFIX)):
+            candidates.setdefault(path.name, path)
+    jobs: list[dict[str, str]] = []
+    reused: list[str] = []
+    for entry in metadata:
+        name = _tar_name(str(entry["archive_name"]))
+        count = segment_count(int(entry["size_bytes"]))
+        segments: list[_Segment | None] = (
+            [None] if count == 1 else [(index, count) for index in range(1, count + 1)]
+        )
+        head: dict[str, Any] | None = None
+
+        def reusable(segment: _Segment | None) -> bool:
+            nonlocal head
+            file_name = part_file_name(name, segment)
+            path = candidates.get(file_name)
+            if path is None:
+                return False
+            if head is None:
+                head = _head(base_url.rstrip("/") + "/" + name, timeout=timeout)
+            try:
+                part = _read_named(path)
+            except ValueError as exc:
+                print(f"not reusing {file_name}: {exc}")
+                return False
+            problems = _part_problems(part, name, segment)
+            problems += [
+                f"{key} was {part.header.get(key)!r}, the server now has {head[key]!r}"
+                for key in ("size_bytes", "etag", "last_modified")
+                if part.header.get(key) != head[key]
+            ]
+            if problems:
+                print(f"not reusing {file_name}: {'; '.join(problems)}")
+                return False
+            if reuse_out is not None:
+                Path(reuse_out).mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, Path(reuse_out) / file_name)
+            reused.append(file_name)
+            return True
+
+        if reusable(None):
+            continue
+        for segment in segments:
+            if segment is not None and reusable(segment):
+                continue
+            file_name = part_file_name(name, segment)
+            jobs.append(
+                {
+                    "tar": name,
+                    "segment": "" if segment is None else f"{segment[0]}/{segment[1]}",
+                    "part": file_name[: -len(_PART_SUFFIX)],
+                }
+            )
+    return jobs, reused
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     metadata = fetch_download_metadata()
     names = [str(entry["archive_name"]) for entry in metadata]
-    if args.force:
+    published: dict[str, Any] | None = None
+    if args.published and Path(args.published).is_file():
+        published = json.loads(Path(args.published).read_text(encoding="utf-8"))
+    if args.scheduled and not published:
+        # Without a published index there is nothing to keep fresh, and a
+        # schedule that started a 153 GB build every week until one succeeds
+        # would be rude to EBI. The first build is always started by hand.
+        reasons = []
+        print("no published index-v6.json: the scheduled run does not start the first build")
+    elif args.force:
         reasons = ["forced"]
     else:
-        published: dict[str, Any] | None = None
-        if args.published and Path(args.published).is_file():
-            published = json.loads(Path(args.published).read_text(encoding="utf-8"))
         reasons = needs_rebuild(published, metadata=metadata, base_url=args.base_url)
+        if not reasons:
+            print(f"up to date: all {len(names)} tars match the published index")
     for reason in reasons:
         print(f"rebuild: {reason}")
-    if not reasons:
-        print(f"up to date: all {len(names)} tars match the published index")
     print(f"{len(names)} tars, {sum(int(e['size_bytes']) for e in metadata):,} bytes")
+    jobs: list[dict[str, str]] = []
+    reused: list[str] = []
+    if reasons:
+        jobs, reused = plan_jobs(
+            metadata, base_url=args.base_url, reuse_dir=args.reuse_dir, reuse_out=args.reuse_out
+        )
+        sizes = {str(e["archive_name"]): int(e["size_bytes"]) for e in metadata}
+        largest = 0
+        for job in jobs:
+            size = sizes[job["tar"]]
+            if job["segment"]:
+                index, count = (int(x) for x in job["segment"].split("/"))
+                start, end = segment_bounds(size, index, count)
+                size = end - start
+            largest = max(largest, size)
+            print(f"job: {job['tar']} {job['segment'] or 'whole'} {size:,} bytes")
+        for file_name in reused:
+            print(f"reused: {file_name}")
+        print(
+            f"{len(jobs)} build jobs (largest {largest:,} bytes), "
+            f"{len(reused)} parts reused from an earlier run"
+        )
     _github_output(
-        {"rebuild": "true" if reasons else "false", "tars": json.dumps(names, separators=(",", ":"))}
+        {
+            "rebuild": "true" if reasons else "false",
+            "jobs": json.dumps(jobs, separators=(",", ":")),
+            "n_jobs": str(len(jobs)),
+        }
     )
     return 0
+
+
+def _parse_segment(text: str | None) -> _Segment | None:
+    if not text:
+        return None
+    match = re.fullmatch(r"([0-9]+)/([0-9]+)", text)
+    if match is None:
+        raise ValueError(f"not a segment: {text!r} (expected e.g. 3/10)")
+    return int(match.group(1)), int(match.group(2))
 
 
 def _filtered_metadata(only: Iterable[str] | None) -> list[dict[str, Any]] | None:
@@ -1052,11 +1590,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = sub.add_parser("plan", help="list the tars and decide whether a rebuild is needed")
     p.add_argument("--published", help="path of the currently published index-v6.json, if any")
     p.add_argument("--force", action="store_true", help="rebuild whatever the server says")
+    p.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="do nothing when no index has been published yet",
+    )
+    p.add_argument("--reuse-dir", help="part files of an earlier run that may be reused")
+    p.add_argument("--reuse-out", help="where to copy the parts that are reused")
     p.add_argument("--base-url", default=V6_BASE_URL)
 
     p = sub.add_parser("build-part", help="stream one tar and write its part file")
     p.add_argument("tar")
     p.add_argument("-o", "--out-dir", default="parts")
+    p.add_argument("--segment", metavar="K/N", help="build segment K of N only, e.g. 3/10")
     p.add_argument("--base-url", default=V6_BASE_URL)
 
     p = sub.add_parser("merge", help="merge part files into index-v6.sqlite and .gz")
@@ -1078,7 +1624,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "plan":
         return _cmd_plan(args)
     if args.command == "build-part":
-        print(build_part(args.tar, args.out_dir, base_url=args.base_url))
+        segment = _parse_segment(args.segment)
+        print(build_part(args.tar, args.out_dir, base_url=args.base_url, segment=segment))
     elif args.command == "merge":
         print(merge_parts(args.parts_dir, args.out, metadata=_filtered_metadata(args.only)))
     elif args.command == "verify":

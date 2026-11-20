@@ -19,7 +19,7 @@ import scigantic_alphafold as af
 cif = af.fetch("P69905")                                 # hemoglobin alpha, mmCIF text
 pdb = af.fetch("P69905", fmt="pdb")                      # the same model as PDB text
 path = af.download("P69905", "structures")               # writes the .cif, returns a pathlib.Path
-many = af.fetch_many(["P0A7G6", "P0A6F5", "P00350"])     # dict of id to text, 8 connections by default
+many = af.fetch_many(["P0A7G6", "P0A6F5", "P00350"])     # dict of id to text, 4 connections by default
 
 af.has("P69905")                                         # True: the accession is in the bulk set
 af.locate("P69905")                                      # [Member(entry_id, fmt, tar, url, offset, length), ...]
@@ -29,7 +29,7 @@ af.metadata("P69905")                                    # EBI prediction API re
 af.proteomes()                                           # EBI's list of bulk tars, with url and tax_id
 ```
 
-A longer walkthrough, including per-residue pLDDT from the B-factor column, is in [examples/quickstart.ipynb](examples/quickstart.ipynb).
+A longer walkthrough, including per-residue pLDDT from the B-factor column, is in [examples/quickstart.ipynb](https://github.com/Scigantic/scigantic-alphafold/blob/main/examples/quickstart.ipynb).
 
 **Coverage is limited to the v6 bulk set: Swiss-Prot plus 46 proteomes, coordinates only.** Most of AlphaFold DB is outside that set and cannot be read with this library. See [What is covered](#what-is-covered) before you depend on it.
 
@@ -78,10 +78,10 @@ According to EBI's [download page](https://alphafold.ebi.ac.uk/download), protei
 
 | function | returns |
 |---|---|
-| `fetch(id, fmt="cif")` | the decompressed text of one structure (`str`) |
-| `fetch_bytes(id, fmt="cif")` | the gzip bytes exactly as stored in the tar |
-| `download(id, outdir, fmt="cif", decompress=True)` | `pathlib.Path` of the file written |
-| `fetch_many(ids, fmt="cif", workers=4, on_error="raise")` | `dict[str, str]` keyed by the ids as given, fetched on a thread pool |
+| `fetch(id, fmt=None)` | the decompressed text of one structure (`str`) |
+| `fetch_bytes(id, fmt=None)` | the gzip bytes exactly as stored in the tar |
+| `download(id, out_dir, fmt=None, decompress=True)` | `pathlib.Path` of the file written |
+| `fetch_many(ids, fmt=None, workers=4, on_error="raise")` | `dict[str, str]` keyed by the ids as given, fetched on a thread pool |
 | `locate(id, fmt=None)` | `list[Member]`; a `Member` has `entry_id`, `fmt`, `tar`, `url`, `offset`, `length` |
 | `has(id)` | `bool`, answered from the index without a request to EBI |
 | `entries(proteome=..., fmt="cif")`, `entries(tar=..., fmt="cif")` | iterator over the entry ids of one tar |
@@ -91,7 +91,7 @@ According to EBI's [download page](https://alphafold.ebi.ac.uk/download), protei
 | `metadata(qualifier, timeout=30.0)` | `list[dict]` from EBI's prediction API |
 | `proteomes(timeout=30.0)` | `list[dict]` from EBI's `download_metadata.json` |
 
-`id` is a UniProt accession (`P69905`) or an AlphaFold DB entry id (`AF-P69905-F1`). `fmt` is `"cif"` or `"pdb"`.
+`id` is a UniProt accession (`P69905`) or an AlphaFold DB entry id (`AF-P69905-F1`). `fmt` is `"cif"` or `"pdb"`; left as `None` it means mmCIF. A member file name such as `AF-P69905-F1-model_v6.pdb.gz` is also accepted as an id and selects its own format; a file name for another version, or one whose extension conflicts with an explicit `fmt`, raises `InvalidIdError`.
 
 How an id resolves:
 
@@ -127,18 +127,21 @@ Both functions retry timeouts and 5xx responses twice with backoff, and never re
 
 1. **The index.** One SQLite file, `index-v6.sqlite`, has a row per structure file: entry id, format, tar, byte offset and length of the gzip member. It also records each tar's size, `Last-Modified` and `ETag` at build time.
 2. **Where the index is hosted.** It is a release asset of this repository: `https://github.com/Scigantic/scigantic-alphafold/releases/download/index-v6/index-v6.sqlite.gz`. EBI does not host or maintain it.
-3. **First use.** The first call that needs the index downloads it to the cache directory, `~/.cache/scigantic-alphafold` by default. The download goes to a temporary name and is renamed into place, so an interrupted download does not leave a partial index. Later calls open the cached file. `import scigantic_alphafold` alone does not download anything.
+3. **First use.** The first call that needs the index downloads it to the cache directory, `~/.cache/scigantic-alphafold` by default. The download goes to a temporary name and is renamed into place, so an interrupted download does not leave a partial index. The download is checked against the SHA-256 published next to it in `index-v6.json`; a mismatch is refused, which can happen for a moment while the index is being republished. Later calls open the cached file. `import scigantic_alphafold` alone does not download anything.
 4. **One range read.** `fetch` looks up the entry, sends one `GET` with a `Range` header to the tar on `ftp.ebi.ac.uk`, and gunzips the bytes that come back. A member is small: the mmCIF of a 217-residue *H. pylori* protein (`AF-G5EB01-F1`) is 47,367 bytes gzipped, read out of a 173 MB tar.
 5. **Staleness check.** If the `Last-Modified` or `ETag` of the response differs from what the index recorded, or the bytes do not gunzip, the offsets can no longer be trusted and the call raises `StaleIndexError`. `af.refresh_index()` downloads the current index again.
 
-Two environment variables change where the index comes from:
+These environment variables change where the index comes from and what it may point at:
 
 | variable | meaning |
 |---|---|
 | `SCIGANTIC_ALPHAFOLD_INDEX` | a local path or a URL of an index to use instead of the default, as `.sqlite` or `.sqlite.gz` |
 | `SCIGANTIC_ALPHAFOLD_CACHE` | the cache directory, instead of `~/.cache/scigantic-alphafold` |
+| `SCIGANTIC_ALPHAFOLD_ALLOW_ANY_HOST` | set to `1` to accept an index whose tars are not on `https://ftp.ebi.ac.uk`, for a private mirror or for tests |
 
-`af.index_info()` reports which index is in use. The index is built by reading every tar once and recording where each member starts; [builders/README.md](builders/README.md) describes the build and how to reproduce it.
+By default the library only sends range requests to `https://ftp.ebi.ac.uk`, whatever the index says, so a wrong or tampered index cannot point it at another host.
+
+`af.index_info()` reports which index is in use. The index is built by reading every tar once and recording where each member starts; [builders/README.md](https://github.com/Scigantic/scigantic-alphafold/blob/main/builders/README.md) describes the build and how to reproduce it.
 
 ## Being a polite client of EBI
 
@@ -163,7 +166,7 @@ $ scigantic-alphafold info                            # the index in use
 $ scigantic-alphafold refresh                         # download the index again
 ```
 
-Two more subcommands, `build-part <tar>` and `merge <parts dir> -o index-v6.sqlite`, build the index. They are documented in [builders/README.md](builders/README.md).
+Two more subcommands, `build-part <tar>` and `merge <parts dir> -o index-v6.sqlite`, build the index; `merge --only <tar>...` builds a partial index from the tars you streamed. They are documented in [builders/README.md](https://github.com/Scigantic/scigantic-alphafold/blob/main/builders/README.md).
 
 ## Data license and citation
 

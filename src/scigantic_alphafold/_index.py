@@ -6,22 +6,45 @@ on the first call that needs it.
 
 Where the index comes from
 --------------------------
-1. ``SCIGANTIC_ALPHAFOLD_INDEX``, when set: a local path or an http(s) URL, to either a
-   ``.sqlite`` file or a gzipped ``.sqlite.gz`` (told apart by content, not by name).
-2. Otherwise the default release URL, :data:`DEFAULT_INDEX_URL`.
+1. ``SCIGANTIC_ALPHAFOLD_INDEX``, when set: a local path (absolute, relative to the
+   current directory, or starting with ``~``) or an http(s) URL, to either a ``.sqlite``
+   file or a gzipped ``.sqlite.gz`` (told apart by content, not by name).
+2. Otherwise the default release URL, :data:`DEFAULT_INDEX_URL`. The release also carries
+   a small ``index-v6.json`` with the SHA-256 of the gzipped index. A download from the
+   default URL is compared with it and refused on a mismatch; when that JSON is absent
+   (HTTP 404) or has no checksum field the download is used unverified.
 
 A plain local ``.sqlite`` is opened in place. Everything else is materialized once under
 the cache directory (``SCIGANTIC_ALPHAFOLD_CACHE``, default ``~/.cache/scigantic-alphafold``):
 written to a unique temporary name in that directory, gunzipped, checked, then renamed
 over the final name with ``os.replace``. Two processes that race each do their own
-download and the last rename wins; a reader never sees a half-written file.
+download and the last rename wins; a reader never sees a half-written file. Temporary
+files left by a killed process are removed once they are a day old.
+
+What the index is trusted for
+-----------------------------
+The index decides which URL is requested and what a downloaded file is called, so its
+content is checked before use. ``meta.afdb_version`` must be digits. Every tar URL must
+be http(s) and lie under ``meta.base_url``, and ``base_url`` must be an https URL on
+``ftp.ebi.ac.uk``. Entry ids, formats, offsets and lengths must be well formed and inside
+the tar. To use a private mirror or a test server, set
+``SCIGANTIC_ALPHAFOLD_ALLOW_ANY_HOST=1``: that lifts the https and EBI host requirements,
+nothing else.
 
 How ids are resolved
 --------------------
 Accepted forms, in any letter case and with surrounding whitespace: a UniProt accession
 (``P69905``), an isoform accession (``P12345-2``), an entry id (``AF-P69905-F1``,
 ``AF-P12345-2-F1``), the same without the ``AF-`` prefix (``P69905-F1``), and a member
-file name (``AF-P69905-F1-model_v6.cif.gz``).
+file name (``AF-P69905-F1-model_v6.cif.gz``, ``AF-P69905-F1-model_v6.pdb``).
+
+A file name carries a version and usually a format, and both are honored:
+
+* The version must be the one the index describes. ``...-model_v4.cif`` against a v6
+  index raises :class:`InvalidIdError` instead of quietly returning the v6 file.
+* When ``fmt`` is not passed, the extension decides (``.pdb.gz`` reads the PDB file).
+  With no extension either, the format is ``cif``.
+* When ``fmt`` is passed and disagrees with the extension, :class:`InvalidIdError`.
 
 * An id that names a fragment (``-F<n>``) resolves to exactly that entry.
 * An accession without a fragment resolves to ``AF-<accession>-F1`` when that is the only
@@ -47,13 +70,17 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import http.client
+import json
 import os
 import re
 import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -61,6 +88,7 @@ from pathlib import Path
 from typing import Any
 
 from ._errors import (
+    AlphaFoldError,
     AmbiguousEntryError,
     IndexSchemaError,
     IndexUnavailableError,
@@ -74,6 +102,10 @@ DEFAULT_INDEX_URL = (
 )
 ENV_INDEX = "SCIGANTIC_ALPHAFOLD_INDEX"
 ENV_CACHE = "SCIGANTIC_ALPHAFOLD_CACHE"
+ENV_ALLOW_ANY_HOST = "SCIGANTIC_ALPHAFOLD_ALLOW_ANY_HOST"
+TRUSTED_HOST = "ftp.ebi.ac.uk"
+SUMMARY_NAME = "index-v6.json"
+SUMMARY_SHA256_KEY = "index_gz_sha256"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({"1"})
 FORMATS = ("cif", "pdb")
 
@@ -81,19 +113,28 @@ _GZIP_MAGIC = b"\x1f\x8b"
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _CHUNK = 1 << 20
 _INDEX_TIMEOUT = 120.0
+_SUMMARY_TIMEOUT = 30.0
 _PAGE = 5000
+_STALE_PART_SECONDS = 24 * 3600.0
+_REPLACE_ATTEMPTS = 5
+_REPLACE_PAUSE = 0.2
+_sleep = time.sleep
 
 _ID_RE = re.compile(
     r"^(?:AF-)?(?P<acc>[A-Z0-9]+(?:-[0-9]+)?)"
     r"(?:-F(?P<frag>[0-9]+))?"
-    r"(?:-MODEL_V[0-9]+(?:\.(?:CIF|PDB))?(?:\.GZ)?)?$"
+    r"(?:-MODEL_V(?P<version>[0-9]+)(?:\.(?P<ext>CIF|PDB)(?:\.GZ)?)?)?$"
 )
+_MEMBER_ENTRY_RE = re.compile(r"^AF-[A-Z0-9]+(?:-[0-9]+)?-F[0-9]+$")
+_VERSION_RE = re.compile(r"^[0-9]+$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ENTRY_RE = re.compile(r"^AF-(?P<acc>[A-Z0-9]+)(?:-(?P<iso>[0-9]+))?-F(?P<frag>[0-9]+)$")
 
 _BULK_SET = (
     "The AlphaFold DB v6 bulk set is Swiss-Prot plus 46 proteome tars (16 model organisms "
     "and 30 global health organisms), not the whole database. This library reads only those "
-    "tars; EBI's per-file endpoint is not used."
+    "tars; EBI's per-file endpoint is not used. A cached index never expires and EBI can add "
+    "tars, so if yours is old, refresh_index() is worth trying."
 )
 
 
@@ -126,8 +167,18 @@ class Tar:
     n_members: int
 
 
-def parse_id(text: str) -> tuple[str, int | None]:
-    """Split an id into (accession, fragment number or None). The accession keeps an isoform suffix."""
+@dataclass(frozen=True)
+class ParsedId:
+    """An id taken apart. ``version`` and ``fmt`` are set only when a file name was given."""
+
+    accession: str
+    fragment: int | None
+    version: str | None
+    fmt: str | None
+
+
+def parse_id_full(text: str) -> ParsedId:
+    """Take an id apart. The accession keeps an isoform suffix (``P12345-2``)."""
     if not isinstance(text, str):
         raise InvalidIdError(f"expected a UniProt accession or an entry id, got {type(text).__name__}")
     match = _ID_RE.match(text.strip().upper())
@@ -137,7 +188,19 @@ def parse_id(text: str) -> tuple[str, int | None]:
             "or an AlphaFold DB entry id (AF-P69905-F1)"
         )
     frag = match.group("frag")
-    return match.group("acc"), (int(frag) if frag is not None else None)
+    ext = match.group("ext")
+    return ParsedId(
+        match.group("acc"),
+        int(frag) if frag is not None else None,
+        match.group("version"),
+        ext.lower() if ext is not None else None,
+    )
+
+
+def parse_id(text: str) -> tuple[str, int | None]:
+    """Split an id into (accession, fragment number or None)."""
+    parsed = parse_id_full(text)
+    return parsed.accession, parsed.fragment
 
 
 def check_fmt(fmt: str) -> str:
@@ -158,23 +221,67 @@ def _entry_key(entry_id: str) -> tuple[int, int, str]:
     return (int(match.group("iso") or 0), int(match.group("frag")), entry_id)
 
 
-def _not_published(url: str) -> str:
+def _abspath(text: str | os.PathLike[str]) -> Path:
+    """Expand ``~`` and make the path absolute, so that it can be a file URI."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(text))))
+
+
+def allow_any_host() -> bool:
+    return os.environ.get(ENV_ALLOW_ANY_HOST, "").strip() == "1"
+
+
+_PARTIAL_TAR = "UP000000429_85962_HELPY_v6.tar"
+
+
+def _not_downloadable(url: str) -> str:
     if url == DEFAULT_INDEX_URL:
         return (
-            f"The scigantic-alphafold index has not been published yet ({url} returned 404). "
-            f"Build one with `scigantic-alphafold build-part <tar>` and `scigantic-alphafold merge "
-            f"<parts dir> -o index-v6.sqlite`, then point {ENV_INDEX} at the local file, for example "
-            f"{ENV_INDEX}=/path/to/index-v6.sqlite."
+            f"The scigantic-alphafold index could not be downloaded ({url} returned 404); it may not "
+            "be published yet or may be mid-update. Try again in a minute. To work without it, build "
+            f"a partial index from one small tar (165 MB is streamed): `scigantic-alphafold build-part "
+            f"{_PARTIAL_TAR} -o parts`, then `scigantic-alphafold merge parts -o index-v6.sqlite "
+            f"--only {_PARTIAL_TAR}`, then set {ENV_INDEX}=index-v6.sqlite."
         )
     return f"No index at {url} (HTTP 404). Check {ENV_INDEX}, or point it at a local index-v6.sqlite file."
 
 
-def _read_schema_version(path: Path) -> str:
-    """Open ``path`` read-only just long enough to read and check ``meta.schema_version``."""
+def _http_get(url: str, dest: Path | None, timeout: float) -> tuple[int, bytes]:
+    """GET ``url`` into ``dest`` (or into memory). Returns (status, body); 404 is returned, not raised."""
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
+    again = f"Try again, or point {ENV_INDEX} at a local index-v6.sqlite file."
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if dest is None:
+                return 200, bytes(response.read())
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(response, out, _CHUNK)
+            return 200, b""
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        exc.close()
+        if code == 404:
+            return 404, b""
+        raise IndexUnavailableError(f"Could not download {url}: HTTP {code}. {again}") from None
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise IndexUnavailableError(
+            f"Could not download {url}: {str(exc) or type(exc).__name__}. {again}"
+        ) from exc
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _check_index(path: Path) -> None:
+    """Open ``path`` read-only just long enough to check that this release can use it."""
     try:
         with open(path, "rb") as handle:
             magic = handle.read(len(_SQLITE_MAGIC))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise IndexUnavailableError(f"Cannot read the index at {path}: {exc}") from exc
     if magic != _SQLITE_MAGIC:
         raise IndexUnavailableError(
@@ -184,21 +291,26 @@ def _read_schema_version(path: Path) -> str:
     try:
         conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
         try:
-            row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            meta = {str(k): str(v) for k, v in conn.execute("SELECT key, value FROM meta")}
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, ValueError) as exc:
         raise IndexUnavailableError(
             f"{path} is not a scigantic-alphafold index ({exc}). Call refresh_index() to download it again."
         ) from exc
-    version = str(row[0]) if row is not None else "missing"
+    version = meta.get("schema_version", "missing")
     if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise IndexSchemaError(
             f"The index at {path} has schema_version {version}, and this release of scigantic-alphafold "
             f"understands only {', '.join(sorted(SUPPORTED_SCHEMA_VERSIONS))}. "
             "Upgrade the package (pip install -U scigantic-alphafold) or use an index built for this release."
         )
-    return version
+    afdb = meta.get("afdb_version")
+    if afdb is None or not _VERSION_RE.match(afdb):
+        raise IndexSchemaError(
+            f"The index at {path} has afdb_version {afdb!r}; it must be a number such as '6'. "
+            "The index is damaged or was not built by scigantic-alphafold."
+        )
 
 
 class Index:
@@ -210,7 +322,10 @@ class Index:
 
     def __init__(self, source: str | None = None, cache_dir: str | os.PathLike[str] | None = None) -> None:
         self.source = source if source else DEFAULT_INDEX_URL
-        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "scigantic-alphafold"
+        # Both paths are made absolute here: a relative path cannot be a SQLite file URI,
+        # and an unexpanded "~" would create a directory literally named "~".
+        self._source_path: Path | None = None if _is_url(self.source) else _abspath(self.source)
+        self.cache_dir = _abspath(cache_dir) if cache_dir else Path.home() / ".cache" / "scigantic-alphafold"
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._path: Path | None = None
@@ -220,10 +335,12 @@ class Index:
     # -- locating and materializing the file ---------------------------------------------
 
     def _local_source(self) -> Path:
-        path = Path(self.source).expanduser()
+        path = self._source_path
+        assert path is not None
         if not path.is_file():
+            shown = self.source if str(path) == self.source else f"{self.source} ({path})"
             raise IndexUnavailableError(
-                f"{ENV_INDEX} points at {self.source}, which is not a file. "
+                f"{ENV_INDEX} points at {shown}, which is not a file. "
                 "It must be a local index-v6.sqlite or index-v6.sqlite.gz, or an http(s) URL to one."
             )
         return path
@@ -238,29 +355,72 @@ class Index:
         key = f"{local}|{stat.st_size}|{stat.st_mtime_ns}"
         return f"index-local-{hashlib.sha256(key.encode()).hexdigest()[:16]}.sqlite"
 
-    def _download(self, dest: Path) -> None:
-        request = urllib.request.Request(
-            self.source, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
-        )
+    def _published_sha256(self) -> str | None:
+        """The checksum the release publishes for the gzipped index, or None when there is none."""
+        url = self.source.rsplit("/", 1)[0] + "/" + SUMMARY_NAME
+        status, body = _http_get(url, None, _SUMMARY_TIMEOUT)
+        if status == 404:
+            return None
         try:
-            with urllib.request.urlopen(request, timeout=_INDEX_TIMEOUT) as response, open(dest, "wb") as out:
-                shutil.copyfileobj(response, out, _CHUNK)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            exc.close()
-            if code == 404:
-                raise IndexUnavailableError(_not_published(self.source)) from None
+            summary = json.loads(body.decode("utf-8"))
+        except ValueError as exc:
             raise IndexUnavailableError(
-                f"Could not download the index from {self.source}: HTTP {code}. "
-                f"Try again, or point {ENV_INDEX} at a local index-v6.sqlite file."
+                f"{url} is not valid JSON ({exc}), so the index download cannot be verified. Try again in a minute."
             ) from None
-        except OSError as exc:
+        value = summary.get(SUMMARY_SHA256_KEY) if isinstance(summary, dict) else None
+        if value is None:
+            return None
+        if not isinstance(value, str) or not _SHA256_RE.match(value.strip().lower()):
             raise IndexUnavailableError(
-                f"Could not download the index from {self.source}: {exc}. "
-                f"Try again, or point {ENV_INDEX} at a local index-v6.sqlite file."
-            ) from exc
+                f"{url} has a {SUMMARY_SHA256_KEY} that is not a SHA-256 ({value!r}), so the index "
+                "download cannot be verified. Try again in a minute."
+            )
+        return value.strip().lower()
 
-    def _materialize(self, final: Path) -> None:
+    def _sweep_stale_parts(self) -> None:
+        """Remove temporary files a killed process left behind, once they are a day old."""
+        try:
+            cutoff = time.time() - _STALE_PART_SECONDS
+            for entry in self.cache_dir.iterdir():
+                if entry.name.startswith(".index-") and entry.name.endswith(".part"):
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            entry.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _replace(self, ready: Path, final: Path, force: bool) -> None:
+        """Rename ``ready`` over ``final``, with nothing of ours holding ``final`` open.
+
+        On Windows a file that any process has open cannot be replaced. Our own
+        connection is closed first. If another process holds the file: a first open
+        (not a refresh) simply uses the good copy that process put there; a refresh
+        retries briefly and then says why it failed.
+        """
+        self.close()
+        failure: OSError | None = None
+        for attempt in range(_REPLACE_ATTEMPTS):
+            if attempt:
+                _sleep(_REPLACE_PAUSE)
+            try:
+                os.replace(ready, final)
+                return
+            except PermissionError as exc:
+                failure = exc
+                if not force and final.is_file():
+                    try:
+                        _check_index(final)
+                        return
+                    except AlphaFoldError:
+                        pass
+        raise IndexUnavailableError(
+            f"Could not replace the cached index at {final}: {failure}. Another process probably has it "
+            "open (on Windows an open file cannot be replaced). Close that process and try again."
+        )
+
+    def _materialize(self, final: Path, force: bool) -> None:
         """Fetch or copy the source, gunzip it if needed, check it, then rename it into place."""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         temps: list[Path] = []
@@ -274,7 +434,18 @@ class Index:
         try:
             if _is_url(self.source):
                 raw = temp()
-                self._download(raw)
+                status, _ = _http_get(self.source, raw, _INDEX_TIMEOUT)
+                if status == 404:
+                    raise IndexUnavailableError(_not_downloadable(self.source))
+                if self.source == DEFAULT_INDEX_URL:
+                    expected = self._published_sha256()
+                    actual = _file_sha256(raw)
+                    if expected is not None and actual != expected:
+                        raise IndexUnavailableError(
+                            f"The index downloaded from {self.source} does not match the checksum published "
+                            f"next to it in {SUMMARY_NAME} (expected sha256 {expected}, got {actual}). It was "
+                            "not installed. The release may be mid-update: try again in a minute."
+                        )
             else:
                 raw = self._local_source()
             with open(raw, "rb") as handle:
@@ -289,13 +460,13 @@ class Index:
                     raise IndexUnavailableError(
                         f"The index from {self.source} is not a complete gzip file ({exc}). Try again."
                     ) from exc
-            _read_schema_version(ready)
-            os.replace(ready, final)
+            _check_index(ready)
+            self._replace(ready, final, force)
         finally:
             for leftover in temps:
                 try:
                     leftover.unlink()
-                except FileNotFoundError:
+                except OSError:
                     pass
 
     def _resolve_path(self, force: bool) -> Path:
@@ -305,8 +476,9 @@ class Index:
                 if handle.read(2) != _GZIP_MAGIC:
                     return local
         final = self.cache_dir / self._cache_name()
+        self._sweep_stale_parts()
         if force or not final.is_file():
-            self._materialize(final)
+            self._materialize(final, force)
         return final
 
     # -- connection --------------------------------------------------------------------------
@@ -315,9 +487,19 @@ class Index:
         with self._lock:
             if self._conn is not None and not force:
                 return self._conn
-            path = self._resolve_path(force)
-            _read_schema_version(path)
-            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, check_same_thread=False)
+            try:
+                path = self._resolve_path(force)
+                _check_index(path)
+                conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, check_same_thread=False)
+            except AlphaFoldError:
+                raise
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                # A cache directory that cannot be created, a path with a null byte, a full disk:
+                # whatever it is, the caller gets one of the library's own errors.
+                raise IndexUnavailableError(
+                    f"Cannot open the index from {self.source} (cache directory {self.cache_dir}): "
+                    f"{str(exc) or type(exc).__name__}"
+                ) from exc
             self.close()
             self._conn = conn
             self._path = path
@@ -349,7 +531,13 @@ class Index:
             return self._path
 
     def refresh(self) -> Path:
-        """Fetch the index again and replace the cached copy. Returns the path now in use."""
+        """Fetch the index again and replace the cached copy. Returns the path now in use.
+
+        The new copy is downloaded and checked first. Only then is this object's
+        connection closed and the file replaced, so a failed download leaves the working
+        index in use, and if the replace itself fails the old file is opened again on
+        the next call.
+        """
         with self._lock:
             self._open(force=True)
             assert self._path is not None
@@ -385,9 +573,32 @@ class Index:
                 f"No tar named {name!r} in the index. tars() lists the {len(self._tar_map())} that are."
             ) from None
 
-    def locate(self, id: str, fmt: str | None = None) -> list[Member]:
-        accession, fragment = parse_id(id)
+    def _wanted(self, id: str, fmt: str | None) -> tuple[ParsedId, str | None]:
+        """Parse ``id`` and settle the format: the explicit ``fmt``, else the id's extension, else None."""
+        parsed = parse_id_full(id)
         wanted = check_fmt(fmt) if fmt is not None else None
+        if parsed.version is not None:
+            indexed = self.meta().get("afdb_version", "")
+            if not indexed.isdigit() or int(parsed.version) != int(indexed):
+                raise InvalidIdError(
+                    f"{id.strip()!r} names AlphaFold DB v{int(parsed.version)}, but the index describes "
+                    f"v{indexed} and only that version can be read."
+                )
+        if parsed.fmt is not None:
+            if wanted is not None and wanted != parsed.fmt:
+                raise InvalidIdError(
+                    f"{id.strip()!r} is a {parsed.fmt} file name but fmt={wanted!r} was asked for. "
+                    "Pass the matching fmt, or leave fmt out and the extension decides."
+                )
+            wanted = parsed.fmt
+        return parsed, wanted
+
+    def locate(self, id: str, fmt: str | None = None) -> list[Member]:
+        parsed, wanted = self._wanted(id, fmt)
+        return self._rows(parsed, wanted)
+
+    def _rows(self, parsed: ParsedId, wanted: str | None) -> list[Member]:
+        accession, fragment = parsed.accession, parsed.fragment
         sql = (
             "SELECT m.entry_id, m.fmt, t.name, t.url, m.offset, m.length "
             "FROM members AS m JOIN tars AS t ON t.tar_id = m.tar_id WHERE "
@@ -405,18 +616,28 @@ class Index:
             sql += " AND m.fmt = ?"
             params += (wanted,)
         members = [Member(*row) for row in self._query(sql, params)]
-        members.sort(key=lambda m: (_entry_key(m.entry_id), m.fmt, m.tar.encode()))
+        for member in members:
+            # The index is data from the network. These two fields end up in file names.
+            if not isinstance(member.entry_id, str) or not _MEMBER_ENTRY_RE.match(member.entry_id):
+                raise IndexSchemaError(f"The index holds a malformed entry id: {member.entry_id!r}")
+            if member.fmt not in FORMATS:
+                raise IndexSchemaError(f"The index holds an unknown format for {member.entry_id}: {member.fmt!r}")
+        members.sort(key=lambda m: (_entry_key(str(m.entry_id)), str(m.fmt), str(m.tar).encode()))
         return members
 
-    def resolve(self, id: str, fmt: str = "cif") -> Member:
-        """The one member a fetch of ``id`` reads, or a clear error."""
-        accession, fragment = parse_id(id)
-        wanted = check_fmt(fmt)
-        members = self.locate(id, wanted)
+    def resolve(self, id: str, fmt: str | None = None) -> Member:
+        """The one member a fetch of ``id`` reads, or a clear error.
+
+        ``fmt=None`` means the extension of a file-name id, and ``cif`` otherwise.
+        """
+        parsed, settled = self._wanted(id, fmt)
+        accession, fragment = parsed.accession, parsed.fragment
+        wanted = settled or "cif"
+        members = self._rows(parsed, wanted)
         if not members:
-            other = self.locate(id)
+            other = self._rows(parsed, None)
             if other:
-                formats = ", ".join(sorted({m.fmt for m in other}))
+                formats = ", ".join(sorted({str(m.fmt) for m in other}))
                 raise NotInBulkSetError(
                     f"{id.strip()} is in the AlphaFold DB v6 bulk tars only as {formats}, not as {wanted}."
                 )
@@ -435,7 +656,51 @@ class Index:
                     f"{why}; ask for one by its entry id: {', '.join(candidates)}", candidates
                 )
             members = [m for m in members if m.entry_id == canonical[0]]
+        self.check_member(members[0])
         return members[0]
+
+    def check_member(self, member: Member) -> None:
+        """Refuse a row that would send a request somewhere unexpected or outside its tar.
+
+        The index is data from the network and it decides which URL and byte range are
+        requested. (Entry ids and formats are checked as rows are read.)
+        """
+        size = self.tar(member.tar).size_bytes
+        ok = isinstance(member.offset, int) and isinstance(member.length, int) and isinstance(size, int)
+        if not ok or member.offset < 0 or member.length <= 0 or member.offset + member.length > size:
+            raise IndexSchemaError(
+                f"The index places {member.entry_id} at offset {member.offset!r}, length {member.length!r} "
+                f"of {member.tar}, which is {size!r} bytes long. That range is not inside the tar."
+            )
+        self.check_tar_url(member.url)
+
+    def check_tar_url(self, url: str) -> None:
+        """Only fetch from where the index says its tars live, and by default only from EBI."""
+        base = (self.meta().get("base_url") or "").strip()
+        relaxed = allow_any_host()
+        opt_out = f"For a private mirror or a test server, set {ENV_ALLOW_ANY_HOST}=1."
+        try:
+            base_parts = urllib.parse.urlsplit(base)
+            base_host = base_parts.hostname
+            scheme = urllib.parse.urlsplit(url).scheme if isinstance(url, str) else ""
+        except ValueError:
+            raise IndexSchemaError(f"The index holds a URL that cannot be parsed: {base!r} or {url!r}") from None
+        if scheme not in ("http", "https"):
+            raise IndexSchemaError(f"The index holds a tar URL that is not http(s): {url!r}")
+        if not relaxed:
+            if base_parts.scheme != "https" or base_host != TRUSTED_HOST:
+                raise IndexSchemaError(
+                    f"The index's base_url is {base!r}, which is not an https URL on {TRUSTED_HOST}, "
+                    f"so nothing is fetched from it. {opt_out}"
+                )
+            if scheme != "https":
+                raise IndexSchemaError(f"The index holds a tar URL that is not https: {url!r}. {opt_out}")
+        if base or not relaxed:
+            if not url.startswith(base.rstrip("/") + "/"):
+                raise IndexSchemaError(
+                    f"The index holds a tar URL outside its own base_url: {url!r} is not under {base!r}. "
+                    "The index is damaged or was not built by scigantic-alphafold."
+                )
 
     def has(self, id: str) -> bool:
         return bool(self.locate(id))
@@ -522,7 +787,9 @@ def locate(id: str, fmt: str | None = None) -> list[Member]:
     """Every stored copy of an accession or entry: all fragments, isoforms, formats and tars.
 
     Returns an empty list when nothing matches. The first row for a given entry and
-    format is the copy that ``fetch`` reads.
+    format is the copy that ``fetch`` reads. A file-name id (``AF-P69905-F1-model_v6.pdb.gz``)
+    limits the rows to its own format unless ``fmt`` says the same thing; a conflicting
+    ``fmt`` or another version number raises :class:`InvalidIdError`.
     """
     return get_index().locate(id, fmt)
 

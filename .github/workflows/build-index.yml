@@ -1,0 +1,129 @@
+name: Build index
+
+# Rebuilds the offset index for the AlphaFold DB v6 bulk tars and publishes it
+# as assets on the "index-v6" release. See builders/README.md.
+#
+# Nothing but the small part files is ever written to disk: each tar is
+# streamed and parsed in memory, because a runner has about 14 GB free and the
+# largest tar is 40 GB.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if no tar changed on the EBI server
+        type: boolean
+        default: true
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-index
+  cancel-in-progress: false
+
+env:
+  # The builder is standard library only, so the source tree is enough.
+  PYTHONPATH: src
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      rebuild: ${{ steps.plan.outputs.rebuild }}
+      tars: ${{ steps.plan.outputs.tars }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch the published summary, if there is one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download index-v6 --pattern index-v6.json --dir published \
+            || echo "no published index-v6.json yet"
+      - name: List the tars and compare them with the published index
+        id: plan
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '--force' || '' }}
+        run: python -m scigantic_alphafold._build plan --published published/index-v6.json $FORCE
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.rebuild == 'true'
+    runs-on: ubuntu-latest
+    # The ceiling for a hosted runner is 360 minutes. swissprot_cif_v6.tar is
+    # 40.1 GB, so it needs a sustained 1.9 MB/s to finish inside 350 minutes.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      # Eight streams at most, to be polite to the EBI server.
+      max-parallel: 8
+      matrix:
+        tar: ${{ fromJSON(needs.plan.outputs.tars) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Stream ${{ matrix.tar }} and write its part file
+        env:
+          TAR: ${{ matrix.tar }}
+        run: python -m scigantic_alphafold._build build-part "$TAR" -o parts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.tar }}
+          path: parts/*.tsv.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: parts
+          merge-multiple: true
+      - name: Merge the parts (fails if a tar is missing or a count is off)
+        run: python -m scigantic_alphafold._build merge parts -o index-v6.sqlite
+      - name: Read members back from EBI with the new index
+        run: python -m scigantic_alphafold._build verify index-v6.sqlite -n 20 --per-tar 2
+      - name: Write the summary
+        run: python -m scigantic_alphafold._build summary index-v6.sqlite -o index-v6.json
+      - name: Publish on the index-v6 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view index-v6 >/dev/null 2>&1; then
+            gh release create index-v6 --latest=false \
+              --target "${{ github.sha }}" \
+              --title "AlphaFold DB v6 offset index" \
+              --notes "Byte-offset index for the AlphaFold DB v6 bulk tars at EBI. Rebuilt by the Build index workflow whenever a tar changes; index-v6.json says when and from which tars."
+          fi
+          # The summary goes last: the scheduled run reads it to decide
+          # whether the published index is current.
+          gh release upload index-v6 index-v6.sqlite.gz --clobber
+          gh release upload index-v6 index-v6.json --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index-v6
+          path: |
+            index-v6.sqlite.gz
+            index-v6.json
+          retention-days: 30

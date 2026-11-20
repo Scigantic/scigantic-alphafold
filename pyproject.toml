@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scigantic-alphafold"
+version = "0.1.0"
+description = "Read single AlphaFold DB v6 structures with one HTTP range request against EBI's public bulk tars, using a prebuilt byte-offset index. No mirror, no account, no key, no runtime dependencies."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT-0" }
+authors = [{ name = "Scigantic" }]
+keywords = ["alphafold", "afdb", "protein-structure", "mmcif", "pdb", "uniprot", "structural-biology", "range-request"]
+classifiers = [
+  "License :: OSI Approved :: MIT No Attribution License (MIT-0)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+# Standard library only at runtime.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "mypy>=1.10"]
+
+[project.urls]
+Homepage = "https://scigantic.com"
+Repository = "https://github.com/Scigantic/scigantic-alphafold"
+Issues = "https://github.com/Scigantic/scigantic-alphafold/issues"
+
+[project.scripts]
+scigantic-alphafold = "scigantic_alphafold.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scigantic_alphafold = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "live: talks to the real EBI server or GitHub; skipped unless SCIGANTIC_ALPHAFOLD_LIVE=1",
+]
+
+[tool.mypy]
+strict = true

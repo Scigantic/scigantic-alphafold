@@ -137,7 +137,33 @@ def _request_once(member: Member, tar: Tar, timeout: float) -> bytes:
         response.close()
 
 
+def _stored_name(data: bytes) -> str | None:
+    """The original file name a gzip header records (RFC 1952 FNAME), or None if it has none."""
+    if len(data) < 10 or data[:2] != b"\x1f\x8b" or not data[3] & 0x08:
+        return None
+    pos = 10
+    if data[3] & 0x04:  # FEXTRA comes before FNAME
+        if len(data) < pos + 2:
+            return None
+        pos += 2 + int.from_bytes(data[pos : pos + 2], "little")
+    end = data.find(b"\x00", pos)
+    if end < 0:
+        return None
+    return data[pos:end].decode("latin-1").rsplit("/", 1)[-1]
+
+
 def _gunzip(member: Member, data: bytes) -> bytes:
+    # EBI's members record their own file name in the gzip header. When it is there it
+    # must be the entry that was asked for, so a wrong offset can never return a
+    # different, perfectly valid structure.
+    stored = _stored_name(data)
+    if stored is not None and not (
+        stored.startswith(f"{member.entry_id}-model_v") and stored.endswith(f".{member.fmt}")
+    ):
+        raise StaleIndexError(
+            f"The bytes at offset {member.offset} of {member.tar} are the file {stored!r}, "
+            f"not {member.entry_id} ({member.fmt}). {_REFRESH}"
+        )
     try:
         return gzip.decompress(data)
     except (OSError, EOFError, zlib.error) as exc:

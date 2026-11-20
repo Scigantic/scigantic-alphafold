@@ -509,3 +509,40 @@ def test_hostile_tar_url_is_refused_for_every_reader(afdb: Afdb, tmp_path: Path)
     assert isinstance(caught.value.errors["P69905"], af.IndexSchemaError)
     assert afdb.server.requests == []
     assert not (tmp_path / "out").exists()
+
+
+# --- the gzip header names the file it holds ------------------------------------------
+
+
+def _gz_named(name: str, payload: bytes = b"data_x\n") -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename=name, mode="wb", fileobj=buf, mtime=0) as fh:
+        fh.write(payload)
+    return buf.getvalue()
+
+
+def _member(entry_id: str = "AF-P69905-F1", fmt: str = "cif") -> af.Member:
+    return af.Member(entry_id=entry_id, fmt=fmt, tar="t.tar", url="https://x/t.tar", offset=512, length=1)
+
+
+def test_stored_name_is_read_from_the_gzip_header() -> None:
+    assert _fetch._stored_name(_gz_named("AF-P69905-F1-model_v6.cif")) == "AF-P69905-F1-model_v6.cif"
+    assert _fetch._stored_name(gzip.compress(b"x", mtime=0)) is None
+    assert _fetch._stored_name(b"") is None
+    assert _fetch._stored_name(b"\x1f\x8b\x08\x08" + b"\x00" * 6 + b"no-terminator") is None
+
+
+def test_matching_stored_name_is_accepted() -> None:
+    data = _gz_named("AF-P69905-F1-model_v6.cif", b"data_AF-P69905-F1\n")
+    assert _fetch._gunzip(_member(), data) == b"data_AF-P69905-F1\n"
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["AF-P68871-F1-model_v6.cif", "AF-P69905-F1-model_v6.pdb", "AF-P69905-F10-model_v6.cif", "AF-P69905-2-F1-model_v6.cif"],
+)
+def test_another_members_bytes_raise_stale_instead_of_returning_it(stored: str) -> None:
+    with pytest.raises(af.StaleIndexError, match="refresh_index"):
+        _fetch._gunzip(_member(), _gz_named(stored))

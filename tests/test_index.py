@@ -850,3 +850,29 @@ def test_stale_part_files_are_swept_after_a_day(afdb: Afdb) -> None:
 def test_not_in_bulk_set_suggests_a_refresh(afdb: Afdb) -> None:
     with pytest.raises(af.NotInBulkSetError, match=r"refresh_index\(\)"):
         _index.get_index().resolve("A0A999ZZZ9", "cif")
+
+
+def test_check_index_waits_out_a_rename_in_progress(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows refuses to open a file for a moment while another process renames over it."""
+    calls = {"n": 0}
+
+    def flaky_open(path: object, mode: str = "r") -> object:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "Permission denied")
+        return open(path, mode)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(_index, "open", flaky_open, raising=False)
+    monkeypatch.setattr(_index, "_sleep", lambda seconds: None)
+    _index._check_index(afdb.index_path)
+    assert calls["n"] == 3
+
+
+def test_check_index_gives_up_on_a_file_that_stays_locked(afdb: Afdb, monkeypatch: pytest.MonkeyPatch) -> None:
+    def locked_open(path: object, mode: str = "r") -> object:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(_index, "open", locked_open, raising=False)
+    monkeypatch.setattr(_index, "_sleep", lambda seconds: None)
+    with pytest.raises(af.IndexUnavailableError, match="Cannot read the index"):
+        _index._check_index(afdb.index_path)

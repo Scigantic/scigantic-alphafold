@@ -278,11 +278,20 @@ def _file_sha256(path: Path) -> str:
 
 def _check_index(path: Path) -> None:
     """Open ``path`` read-only just long enough to check that this release can use it."""
-    try:
-        with open(path, "rb") as handle:
-            magic = handle.read(len(_SQLITE_MAGIC))
-    except (OSError, ValueError) as exc:
-        raise IndexUnavailableError(f"Cannot read the index at {path}: {exc}") from exc
+    magic = b""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            with open(path, "rb") as handle:
+                magic = handle.read(len(_SQLITE_MAGIC))
+            break
+        except PermissionError as exc:
+            # On Windows a file is briefly unopenable while another process renames a
+            # fresh copy over it. Wait for that to finish instead of failing the call.
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise IndexUnavailableError(f"Cannot read the index at {path}: {exc}") from exc
+            _sleep(_REPLACE_PAUSE)
+        except (OSError, ValueError) as exc:
+            raise IndexUnavailableError(f"Cannot read the index at {path}: {exc}") from exc
     if magic != _SQLITE_MAGIC:
         raise IndexUnavailableError(
             f"{path} is not a SQLite index (it does not start with the SQLite header). "

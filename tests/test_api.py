@@ -250,8 +250,10 @@ def test_metadata_connection_refused_is_not_retried(monkeypatch: pytest.MonkeyPa
     waits: list[float] = []
     monkeypatch.setattr(_api, "API_BASE_URL", fake.base + "/api")
     monkeypatch.setattr(time, "sleep", waits.append)
+    # Windows retries the SYN to a closed loopback port for about 2 s before it reports the
+    # refusal, so a 2 s timeout races it and the call is retried as a timeout. Leave room.
     with pytest.raises(_api.ApiError) as caught:
-        _api.metadata("P69905", timeout=2.0)
+        _api.metadata("P69905", timeout=30.0)
     assert caught.value.status is None
     assert waits == []
 

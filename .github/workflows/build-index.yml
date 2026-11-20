@@ -109,8 +109,11 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      # Eight streams at most, to be polite to the EBI server.
-      max-parallel: 8
+      # EBI serves about 1.1 MB/s per connection wherever the client is, so the
+      # number of streams is the only thing that sets how long a full build
+      # takes: 153 GB is about 5 hours at 8 and about 2 at 20. Twenty is also
+      # the concurrent-job limit of a free GitHub plan.
+      max-parallel: 20
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:

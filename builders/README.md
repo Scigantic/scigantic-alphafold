@@ -217,7 +217,7 @@ The workflow runs on demand and every Monday at 04:17 UTC.
    the 48 tars today that is 64 jobs: 45 whole tars, 2 segments for SOYBN
    (7.6 GB), 10 for `swissprot_cif_v6.tar` and 7 for `swissprot_pdb_v6.tar`.
    The largest job is the human proteome, 5.2 GB.
-2. `build` runs those jobs, eight at a time, each uploading its part file as
+2. `build` runs those jobs, twenty at a time, each uploading its part file as
    an artifact. Jobs that fail can be re-run on their own.
 3. `publish` downloads the parts, merges, spot checks 20 random members plus 2
    from every tar, writes `index-v6.json` (build time, per-tar name, size,
@@ -260,9 +260,11 @@ Things to know:
   minutes. At 1.2 MB/s a 4 GiB segment takes about an hour and the human
   proteome about 72 minutes. Parsing is not the limit: the stream walk runs
   at about 340 MB/s against a local server.
-* All 64 jobs together are 153 GB. If eight parallel streams each keep
-  1.2 MB/s, that is about four and a half hours. Whether the rate holds with
-  eight streams has not been measured.
+* All 64 jobs together are 153 GB. Eight parallel streams held about
+  1.1 MB/s each (20 GB in the first 38 minutes of a run), which is about five
+  hours for a full build. The workflow now runs twenty; if the per-stream
+  rate holds, that is about two hours. Whether it holds at twenty has not
+  been measured.
 * A job that hits the time limit starts its tar or segment again from the
   beginning on re-run: resume works within a job, not across jobs.
 * Runners have about 14 GB of free disk. The build writes only part files

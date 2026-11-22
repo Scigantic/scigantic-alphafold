@@ -11,7 +11,7 @@
         <img alt="License" src="https://img.shields.io/github/license/Scigantic/scigantic-alphafold" /></a>
 </p>
 
-Read a single [AlphaFold DB](https://alphafold.ebi.ac.uk/) v6 structure with one HTTP range request against EBI's public bulk tars, using a prebuilt byte-offset index. No mirror, no account, no key, and no multi-gigabyte tar download to get one protein.
+Fetch an AlphaFold predicted protein structure by UniProt accession from Python, as mmCIF or PDB text. Each structure is read from [AlphaFold DB](https://alphafold.ebi.ac.uk/) v6 with one HTTP range request against EBI's public bulk tars, using a prebuilt byte-offset index. No mirror, no account, no key, and no multi-gigabyte tar download to get one protein.
 
 ```python
 import scigantic_alphafold as af
@@ -32,6 +32,10 @@ af.proteomes()                                           # EBI's list of bulk ta
 A longer walkthrough, including per-residue pLDDT from the B-factor column, is in [examples/quickstart.ipynb](https://github.com/Scigantic/scigantic-alphafold/blob/main/examples/quickstart.ipynb).
 
 **Coverage is limited to the v6 bulk set: Swiss-Prot plus 46 proteomes, coordinates only.** Most of AlphaFold DB is outside that set and cannot be read with this library. See [What is covered](#what-is-covered) before you depend on it.
+
+## Try it on hosted data
+
+The Scigantic catalog entry for the [AlphaFold Protein Structure Database](https://scigantic.com/archive/8000b558-b2e6-5708-aa3b-9fb42197d1b6?utm_source=github&utm_medium=readme&utm_campaign=scigantic-alphafold) opens a Jupyter notebook in the browser with EBI's bulk release mounted read-only: the same per-proteome and Swiss-Prot tars this library indexes, read in place with no download. More open structure data is listed under [protein structure datasets](https://scigantic.com/topics/protein-structure?utm_source=github&utm_medium=readme&utm_campaign=scigantic-alphafold).
 
 ## Installation
 

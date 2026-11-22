@@ -35,7 +35,7 @@ dev = ["pytest>=7", "mypy>=1.10"]
 
 [project.urls]
 Homepage = "https://scigantic.com"
-"AlphaFold DB, hosted notebook" = "https://scigantic.com/archive/8000b558-b2e6-5708-aa3b-9fb42197d1b6?utm_source=pypi&utm_medium=project-urls&utm_campaign=scigantic-alphafold"
+"AlphaFold in a hosted notebook" = "https://scigantic.com/archive/8000b558-b2e6-5708-aa3b-9fb42197d1b6?utm_source=pypi&utm_medium=project-urls&utm_campaign=scigantic-alphafold"
 Repository = "https://github.com/Scigantic/scigantic-alphafold"
 Issues = "https://github.com/Scigantic/scigantic-alphafold/issues"
 Documentation = "https://github.com/Scigantic/scigantic-alphafold#readme"

@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: scigantic-alphafold
+abstract: "Read single AlphaFold DB v6 structures with one HTTP range request against EBI's public bulk tars, using a prebuilt byte-offset index. No mirror, account, key or runtime dependencies are needed."
+authors:
+  - name: Scigantic
+    website: https://scigantic.com
+repository-code: https://github.com/Scigantic/scigantic-alphafold
+url: https://pypi.org/project/scigantic-alphafold/
+license: MIT-0
+keywords:
+  - "alphafold"
+  - "afdb"
+  - "protein-structure"
+  - "mmcif"
+  - "pdb"
+  - "uniprot"
+  - "structural-biology"
+  - "range-request"
+version: "0.1.1"
+date-released: '2026-11-21'

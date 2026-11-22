@@ -1,2 +1,2 @@
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 USER_AGENT = f"scigantic-alphafold/{__version__} (+https://github.com/Scigantic/scigantic-alphafold)"
